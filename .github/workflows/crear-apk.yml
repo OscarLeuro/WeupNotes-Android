@@ -3,34 +3,39 @@ name: Compilar WeupNotes Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   apk:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Obtener código
         uses: actions/checkout@v4
-      - name: Configurar Java
+      - name: Preparar Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Configurar SDK Android
-        uses: android-actions/setup-android@v3
+      - name: Instalar SDK Android 35
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager)"; fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
       - name: Configurar Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Compilar APK instalable
+      - name: Compilar APK
         run: gradle --no-daemon :app:assembleDebug
-      - name: Verificar que se generó
+      - name: Verificar APK
         run: |
           test -s app/build/outputs/apk/debug/app-debug.apk
           sha256sum app/build/outputs/apk/debug/app-debug.apk
-      - name: Descargar APK desde Actions
+      - name: Adjuntar APK instalable
         uses: actions/upload-artifact@v4
         with:
           name: WeupNotes-v1.1.0-Android-APK
