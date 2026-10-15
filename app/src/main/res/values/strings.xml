@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WeupNotes</string>
+    <string name="offline_title">No se pudo cargar WeupNotes</string>
+    <string name="offline_message">Comprueba tu conexión a Internet e inténtalo nuevamente.</string>
+    <string name="try_again">Reintentar</string>
+    <string name="download_started">Descarga iniciada</string>
+    <string name="download_failed">No se pudo iniciar la descarga</string>
+    <string name="no_app">No se encontró una aplicación compatible</string>
+    <string name="file_picker_failed">No se pudo abrir el selector de archivos</string>
+</resources>

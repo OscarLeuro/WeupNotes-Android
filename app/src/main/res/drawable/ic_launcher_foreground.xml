@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Libreta blanca y esquinas suavizadas -->
+    <path android:fillColor="#FFFFFFFF" android:pathData="M35,27 L72,27 Q78,27 78,33 L78,76 Q78,81 72,81 L35,81 Q30,81 30,76 L30,32 Q30,27 35,27 Z"/>
+    <path android:fillColor="#FFE92176" android:pathData="M40,27 L44,27 L44,81 L40,81 Z"/>
+    <path android:strokeColor="#FFE92176" android:strokeWidth="3" android:strokeLineCap="round" android:pathData="M51,42 L68,42 M51,51 L68,51 M51,60 L64,60"/>
+    <path android:fillColor="#FFE92176" android:pathData="M65,27 L73,27 L73,42 L69,38 L65,42 Z"/>
+</vector>
