@@ -20,10 +20,6 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Message;
 import android.view.Gravity;
-import android.view.MotionEvent;
-import android.app.AlertDialog;
-import android.content.res.ColorStateList;
-import java.util.Locale;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
@@ -46,10 +42,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
-import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.io.InputStream;
 import java.io.ByteArrayOutputStream;
-import java.util.List;
 
 /**
  * WeupNotes Android shell. Autor: Weupperu.com.
@@ -68,19 +63,9 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> uploadCallback;
     private PermissionRequest mediaRequest;
     private boolean mainFrameError = false;
-    private TextView pendingBanner;
-    private boolean offlineOpenedForFailure = false;
-    private FrameLayout wheelHost;
-    private View wheelShade;
-    private Button wheelButton;
-    private final Button[] wheelOptions = new Button[4];
-    private final float[] wheelDx = new float[4];
-    private final float[] wheelDy = new float[4];
-    private boolean wheelOpen;
-    private boolean startedWheelOpen;
-    private int highlighted = -1;
-    private float wheelDownX, wheelDownY;
-
+    public static final String ACTION_WIDGET_NOTE = "com.weupperu.weupnotes.WIDGET_NOTE";
+    public static final String ACTION_WIDGET_SEARCH = "com.weupperu.weupnotes.WIDGET_SEARCH";
+    private String pendingShortcut;
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -91,9 +76,7 @@ public class MainActivity extends Activity {
         setContentView(root);
         initWebView();
         initOverlay();
-        initWheel();
-        initPendingBanner();
-        refreshPendingBanner();
+        pendingShortcut = shortcutFromIntent(getIntent());
         if (state != null) {
             webView.restoreState(state);
             if (webView.getUrl() == null) webView.loadUrl(HOME);
@@ -133,7 +116,6 @@ public class MainActivity extends Activity {
             }
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 mainFrameError = false;
-                offlineOpenedForFailure = false;
                 errorPanel.setVisibility(View.GONE);
                 progress.setVisibility(View.VISIBLE);
             }
@@ -143,9 +125,8 @@ public class MainActivity extends Activity {
                 CookieManager.getInstance().flush();
                 if (!mainFrameError && isTrusted(Uri.parse(url))) {
                     injectWebWheel();
-                    wheelHost.setVisibility(View.GONE);
+                    dispatchPendingShortcut();
                 }
-                refreshPendingBanner();
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError error) {
                 if (req.isForMainFrame()) showError();
@@ -161,7 +142,6 @@ public class MainActivity extends Activity {
                 root.removeView(progress);
                 root.addView(progress);
                 errorPanel.bringToFront();
-                wheelHost.bringToFront();
                 showError();
                 return true;
             }
@@ -223,7 +203,7 @@ public class MainActivity extends Activity {
     private void initOverlay() {
         progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progress.setMax(100);
-        progress.setProgressTintList(android.content.res.ColorStateList.valueOf(getColor(R.color.brand)));
+        progress.setProgressTintList(android.content.res.ColorStateList.valueOf(0xFF40536B));
         FrameLayout.LayoutParams bar = new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(3), Gravity.TOP);
         root.addView(progress, bar);
@@ -235,12 +215,12 @@ public class MainActivity extends Activity {
         errorPanel.setPadding(dp(28), dp(28), dp(28), dp(28));
         TextView icon = new TextView(this);
         icon.setText("✎");
-        icon.setTextColor(getColor(R.color.brand));
+        icon.setTextColor(0xFF40536B);
         icon.setGravity(Gravity.CENTER);
         icon.setTextSize(45);
         errorPanel.addView(icon);
         TextView title = new TextView(this);
-        title.setText(R.string.offline_title);
+        title.setText(R.string.connection_title);
         title.setTextColor(getColor(R.color.ink));
         title.setTypeface(null, Typeface.BOLD);
         title.setTextSize(21);
@@ -249,7 +229,7 @@ public class MainActivity extends Activity {
         titleParams.topMargin = dp(15);
         errorPanel.addView(title, titleParams);
         TextView description = new TextView(this);
-        description.setText(R.string.offline_message);
+        description.setText(R.string.connection_message);
         description.setTextColor(getColor(R.color.secondary));
         description.setTextSize(15);
         description.setGravity(Gravity.CENTER);
@@ -261,7 +241,7 @@ public class MainActivity extends Activity {
         retry.setText(R.string.try_again);
         retry.setTextColor(Color.WHITE);
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(getColor(R.color.brand));
+        bg.setColor(0xFF40536B);
         bg.setCornerRadius(dp(12));
         retry.setBackground(bg);
         LinearLayout.LayoutParams retryParams = new LinearLayout.LayoutParams(dp(180), dp(48));
@@ -269,217 +249,89 @@ public class MainActivity extends Activity {
         errorPanel.addView(retry, retryParams);
         retry.setOnClickListener(v -> {
             if (!hasNetwork()) {
-                toast(R.string.offline_message);
+                toast(R.string.connection_message);
                 return;
             }
             mainFrameError = false;
             errorPanel.setVisibility(View.GONE);
             webView.loadUrl(HOME);
         });
-        // La pantalla de notas se abre directamente al perder conexión; no hay botón «Locales».
         errorPanel.setVisibility(View.GONE);
         root.addView(errorPanel, new FrameLayout.LayoutParams(-1, -1));
     }
 
-    /** Topbar contabiliza operaciones locales aún no confirmadas por el servidor. */
-    private void initPendingBanner() {
-        pendingBanner = new TextView(this);
-        pendingBanner.setTextColor(Color.WHITE);
-        pendingBanner.setTextSize(12);
-        pendingBanner.setGravity(Gravity.CENTER);
-        pendingBanner.setTypeface(null, Typeface.BOLD);
-        pendingBanner.setContentDescription("Cambios pendientes de sincronizar, tocar para revisar");
-        pendingBanner.setOnClickListener(v -> onPendingClicked());
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1,dp(31),Gravity.TOP);
-        root.addView(pendingBanner,lp);
-        pendingBanner.setVisibility(View.GONE);
+    /** Only loads the live web interface; no offline editing, queue, banner or local-note storage. */
+    private void injectWebWheel() {
+        try (InputStream in = getAssets().open("weup-wheel.js");
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[4096]; int n;
+            while ((n = in.read(buffer)) != -1) out.write(buffer, 0, n);
+            webView.evaluateJavascript(out.toString("UTF-8"), ignored -> {});
+        } catch (Exception ignored) { /* The official web remains accessible if the optional wheel fails. */ }
     }
-    private void refreshPendingBanner() {
-        if (pendingBanner == null) return;
-        int pending;
-        try { pending = OfflineStore.all(this).size(); }
-        catch (Exception e) { pending = -1; }
-        boolean offline = !hasNetwork() || mainFrameError;
-        pendingBanner.setVisibility(offline || pending != 0 ? View.VISIBLE : View.GONE);
-        pendingBanner.setBackgroundColor(themeColor());
-        pendingBanner.setText(pending < 0 ? "Notas pendientes: no fue posible leerlas" :
-            pending + (pending==1 ? " cambio sin guardar" : " cambios sin guardar") +
-            (offline ? "  ·  Sin conexión" : "  ·  Pendiente de sincronizar"));
-        FrameLayout.LayoutParams webLp = (FrameLayout.LayoutParams)webView.getLayoutParams();
-        webLp.topMargin = pendingBanner.getVisibility()==View.VISIBLE ? dp(31) : 0;
-        webView.setLayoutParams(webLp);
-        pendingBanner.bringToFront();
+
+    private String shortcutFromIntent(Intent intent) {
+        if (intent == null) return null;
+        if (ACTION_WIDGET_NOTE.equals(intent.getAction())) return "note";
+        if (ACTION_WIDGET_SEARCH.equals(intent.getAction())) return "search";
+        return null;
     }
-    private int themeColor() {
-        return getSharedPreferences("appearance", MODE_PRIVATE).getInt("accent", getColor(R.color.brand));
+
+    private int indexForAction(String action) {
+        if ("note".equals(action)) return 0;
+        if ("space".equals(action)) return 1;
+        if ("notebook".equals(action)) return 2;
+        if ("search".equals(action)) return 3;
+        return -1;
     }
-    private void onPendingClicked() {
-        if (!hasNetwork() || mainFrameError) {
-            openLocal(OfflineActivity.ACTION_LIST);
+
+    private boolean webReady() {
+        String url = webView.getUrl();
+        return !mainFrameError && url != null && isTrusted(Uri.parse(url));
+    }
+
+    private void dispatchPendingShortcut() {
+        if (pendingShortcut == null) return;
+        final int action = indexForAction(pendingShortcut);
+        pendingShortcut = null;
+        // Allow the browser UI to mount its sidebar after initial document load.
+        if (action >= 0) webView.postDelayed(() -> {
+            if (!isFinishing() && webReady()) activate(action);
+        }, 700);
+    }
+
+    @Override protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        pendingShortcut = shortcutFromIntent(intent);
+        if (pendingShortcut != null) {
+            if (webReady()) dispatchPendingShortcut();
+            else if (hasNetwork()) webView.loadUrl(HOME);
+        }
+    }
+
+    /** Invokes visible web controls only; never sends undocumented API requests. */
+    private void activate(int action) {
+        if (!hasNetwork() || !webReady()) {
+            Toast.makeText(this, R.string.connection_message, Toast.LENGTH_SHORT).show();
             return;
         }
-        new AlertDialog.Builder(this).setTitle("Cambios guardados en este teléfono")
-            .setMessage("Hay notas protegidas en el dispositivo que todavía no se han enviado al servidor. " +
-                "La sincronización segura necesita habilitar las revisiones y la API en WeupNotes web. " +
-                "No se borrará ningún cambio ni se marcará como sincronizado sin confirmación del servidor.")
-            .setPositiveButton("Ver mis notas", (d,w) -> openLocal(OfflineActivity.ACTION_LIST))
-            .setNegativeButton("Cerrar",null).show();
-    }
-    /** Inyecta acciones dentro de la web: clona los iconos reales del sidebar y lee el color del tema. */
-    private void injectWebWheel() {
-        try (InputStream in = getAssets().open("weup-wheel.js"); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] chunk = new byte[4096]; int n;
-            while ((n=in.read(chunk))>=0) out.write(chunk,0,n);
-            webView.evaluateJavascript(out.toString("UTF-8"), ignored -> {});
-            webView.evaluateJavascript("(function(){const s=getComputedStyle(document.documentElement);const b=getComputedStyle(document.body);"+
-                "const vars=['--theme-primary','--theme-color','--color-primary','--primary-color','--primary','--accent-color','--accent','--brand-color','--brand','--weup-primary'];"+
-                "for(const k of vars){const v=s.getPropertyValue(k).trim()||b.getPropertyValue(k).trim();if(v && (v[0]==='#'||v.startsWith('rgb')))return v;}"+
-                "const a=document.querySelector('aside .active,nav .active,[data-sidebar] .active');return a?getComputedStyle(a).backgroundColor:'';})()", value -> {
-                    try { String css = new org.json.JSONTokener(value).nextValue().toString();
-                        if (css.startsWith("#") || css.startsWith("rgb")) {
-                            int parsed = Color.parseColor(css);
-                            getSharedPreferences("appearance",MODE_PRIVATE).edit().putInt("accent",parsed).apply();
-                            refreshPendingBanner();
-                        }
-                    } catch (Exception ignored) {};
-                });
-        } catch (Exception ignored) { /* La web funciona aunque falte el recurso opcional. */ }
-    }
-
-    private android.graphics.drawable.GradientDrawable circle(int color) {
-        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
-        shape.setColor(color); shape.setCornerRadius(dp(80));
-        return shape;
-    }
-
-    /** A native pie-style quick action menu, supporting hold-drag-release and regular taps. */
-    private void initWheel() {
-        wheelHost = new FrameLayout(this);
-        root.addView(wheelHost, new FrameLayout.LayoutParams(-1, -1));
-        wheelShade = new View(this); wheelShade.setBackgroundColor(0x44000000);
-        wheelShade.setOnClickListener(v -> closeWheel());
-        wheelHost.addView(wheelShade, new FrameLayout.LayoutParams(-1, -1));
-        wheelShade.setVisibility(View.GONE);
-        String[] names = {"＋\nNota", "▦\nEspacio", "▤\nLibreta", "⚲\nBuscar"};
-        String[] descriptions = {"Agregar una nota", "Agregar un nuevo espacio",
-            "Agregar una nueva libreta", "Buscar"};
-        for (int i=0; i<4; i++) {
-            final int which = i;
-            double angle = Math.toRadians(180 + 30 * i);
-            wheelDx[i] = (float)(Math.cos(angle)*dp(143));
-            wheelDy[i] = (float)(Math.sin(angle)*dp(143));
-            Button option = new Button(this);
-            option.setText(names[i]); option.setTextSize(17); option.setAllCaps(false);
-            option.setTextColor(Color.WHITE); option.setBackground(circle(themeColor()));
-            option.setElevation(dp(6)); option.setContentDescription(descriptions[i]);
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(74),dp(74),Gravity.END|Gravity.BOTTOM);
-            lp.rightMargin = Math.round(dp(10) - wheelDx[i]);
-            lp.bottomMargin = Math.round(dp(12) - wheelDy[i]);
-            wheelHost.addView(option,lp);
-            option.setOnClickListener(v -> { closeWheel(); activate(which); });
-            option.setVisibility(View.GONE); wheelOptions[i] = option;
-        }
-        wheelButton = new Button(this);
-        wheelButton.setText("+"); wheelButton.setTextSize(29); wheelButton.setTextColor(Color.WHITE);
-        wheelButton.setAllCaps(false); wheelButton.setBackground(circle(themeColor()));
-        wheelButton.setElevation(dp(9)); wheelButton.setContentDescription("Acciones rápidas");
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(58),dp(58),Gravity.END|Gravity.BOTTOM);
-        lp.rightMargin=dp(18); lp.bottomMargin=dp(20);
-        wheelHost.addView(wheelButton,lp);
-        wheelButton.setOnClickListener(v -> { if (wheelOpen) closeWheel(); else openWheel(); });
-        wheelButton.setOnTouchListener((v,event) -> {
-            switch (event.getActionMasked()) {
-                case MotionEvent.ACTION_DOWN:
-                    startedWheelOpen = wheelOpen;
-                    wheelDownX=event.getRawX(); wheelDownY=event.getRawY();
-                    if (!wheelOpen) openWheel();
-                    return true;
-                case MotionEvent.ACTION_MOVE:
-                    float offsetX=event.getRawX()-wheelDownX;
-                    float offsetY=event.getRawY()-wheelDownY;
-                    int best=-1; float distance=dp(47);
-                    for (int i=0;i<4;i++) {
-                        float dx=offsetX-wheelDx[i], dy=offsetY-wheelDy[i];
-                        float d=(float)Math.sqrt(dx*dx+dy*dy);
-                        if (d<distance) { distance=d; best=i; }
-                    }
-                    highlight(best);
-                    return true;
-                case MotionEvent.ACTION_UP:
-                    int chosen=highlighted;
-                    if (chosen>=0) { closeWheel(); v.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY); activate(chosen); }
-                    else if (startedWheelOpen) closeWheel();
-                    highlight(-1);
-                    v.sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED);
-                    return true;
-                case MotionEvent.ACTION_CANCEL:
-                    highlight(-1); if (!startedWheelOpen) closeWheel(); return true;
-            }
-            return false;
-        });
-    }
-    private void openWheel() {
-        wheelOpen=true;
-        wheelShade.setVisibility(View.VISIBLE);
-        for(Button b: wheelOptions) b.setVisibility(View.VISIBLE);
-        wheelButton.setText("×"); wheelButton.setContentDescription("Cerrar acciones rápidas");
-    }
-    private void closeWheel() {
-        wheelOpen=false;
-        wheelShade.setVisibility(View.GONE);
-        for(Button b: wheelOptions) b.setVisibility(View.GONE);
-        wheelButton.setText("+"); wheelButton.setContentDescription("Acciones rápidas");
-        highlight(-1);
-    }
-    private void highlight(int selected) {
-        highlighted=selected;
-        for (int i=0;i<wheelOptions.length;i++) {
-            Button b=wheelOptions[i]; boolean active=i==selected;
-            b.setScaleX(active?1.17f:1f); b.setScaleY(active?1.17f:1f);
-            b.setBackground(circle(active?getColor(R.color.ink):themeColor()));
-        }
-    }
-    private void openLocal(String action) {
-        Intent intent = new Intent(this, OfflineActivity.class);
-        intent.setAction(action); startActivity(intent);
-    }
-    private boolean webReady() {
-        String url=webView.getUrl();
-        return hasNetwork() && !mainFrameError && url!=null && isTrusted(Uri.parse(url));
-    }
-    private void activate(int action) {
-        if (action==0) {
-            webAction("note", ()->openLocal(OfflineActivity.ACTION_NEW));
-        } else if(action==1) {
-            webAction("space", ()->unavailable("La creación de espacios requiere abrir la web con conexión. Usa el botón Crear espacio de WeupNotes."));
-        } else if(action==2) {
-            webAction("notebook", ()->unavailable("La creación de libretas requiere abrir la web con conexión. Usa el botón Crear libreta de WeupNotes."));
-        } else {
-            webAction("search", ()->openLocal(OfflineActivity.ACTION_SEARCH));
-        }
-    }
-    private void unavailable(String message) {
-        new AlertDialog.Builder(this).setTitle("Acción en WeupNotes web")
-            .setMessage(message).setPositiveButton("Entendido",null).show();
-    }
-    /** Try the actual visible controls, never invent undocumented POST routes. */
-    private void webAction(String action, Runnable fallback) {
-        if (!webReady()) { fallback.run(); return; }
-        // Dispatching this event lets the server-side mobile shell provide a stable hook later.
-        String js="(function(){"+
-            "const a='"+action+"';document.dispatchEvent(new CustomEvent('weupnotes:native-action',{detail:{action:a}}));"+
-            "const norm=s=>(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();"+
-            "if(a==='search'){let x=document.querySelector('input[type=search], input[aria-label*=Buscar], input[placeholder*=Buscar]');"+
-            "if(x){x.focus();x.click();return true;}}"+
-            "const rx={note:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?nota)/,"+
-            "space:/((nuevo?|crear|agregar|anadir)\\s+(un?\\s+)?espacio)/,"+
-            "notebook:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?libreta)/,"+
-            "search:/buscar/}[a];"+
-            "if(!rx)return false;const xs=Array.from(document.querySelectorAll('button,[role=button],a'));"+
-            "const el=xs.find(e=>e.getClientRects().length&&rx.test(norm([e.getAttribute('aria-label'),e.getAttribute('title'),e.innerText].filter(Boolean).join(' '))));"+
+        final String actionName = new String[]{"note", "space", "notebook", "search"}[action];
+        String js = "(function(){" +
+            "const a='" + actionName + "';document.dispatchEvent(new CustomEvent('weupnotes:native-action',{detail:{action:a}}));" +
+            "const norm=s=>(s||'').normalize('NFD').replace(/[\\u0300-\\u036f]/g,'').toLowerCase().trim();" +
+            "if(a==='search'){let x=document.querySelector('input[type=search],input[aria-label*=Buscar],input[placeholder*=Buscar]');" +
+            "if(x){x.focus();x.click();return true;}}" +
+            "const rx={note:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?nota)/," +
+            "space:/((nuevo?|crear|agregar|anadir)\\s+(un?\\s+)?espacio)/," +
+            "notebook:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?libreta)/," +
+            "search:/buscar/}[a];" +
+            "if(!rx)return false;const xs=Array.from(document.querySelectorAll('button,[role=button],a'));" +
+            "const el=xs.find(e=>e.getClientRects().length&&rx.test(norm([e.getAttribute('aria-label'),e.getAttribute('title'),e.innerText].filter(Boolean).join(' '))));" +
             "if(el){el.click();return true;}return false;})()";
         webView.evaluateJavascript(js, result -> {
-            if (!"true".equals(result)) fallback.run();
+            if (!"true".equals(result))
+                Toast.makeText(this, R.string.action_unavailable, Toast.LENGTH_SHORT).show();
         });
     }
 
@@ -490,9 +342,8 @@ public class MainActivity extends Activity {
 
     private boolean routeNavigation(Uri uri) {
         if ("weupnotes-action".equalsIgnoreCase(uri.getScheme())) {
-            String name=uri.getHost();
-            int index="note".equals(name)?0:"space".equals(name)?1:"notebook".equals(name)?2:"search".equals(name)?3:-1;
-            if (index>=0) activate(index);
+            int action = indexForAction(uri.getHost());
+            if (action >= 0) activate(action);
             return true;
         }
         if (isTrusted(uri)) return false;
@@ -593,13 +444,6 @@ public class MainActivity extends Activity {
 
     private void showError() {
         mainFrameError = true;
-        refreshPendingBanner();
-        wheelHost.setVisibility(View.VISIBLE);
-        if (!offlineOpenedForFailure) {
-            offlineOpenedForFailure=true;
-            // Entrada directa al listado/editor: no se obliga a ir a otra zona «local».
-            openLocal(OfflineActivity.ACTION_LIST);
-        }
         errorPanel.setVisibility(View.VISIBLE);
         errorPanel.bringToFront();
         progress.setVisibility(View.GONE);
@@ -632,19 +476,12 @@ public class MainActivity extends Activity {
         super.onSaveInstanceState(outState);
     }
     @Override public void onBackPressed() {
-        if (wheelOpen) { closeWheel(); return; }
-        if (errorPanel.getVisibility() == View.VISIBLE) {
-            super.onBackPressed();
-        } else if (webView.canGoBack()) {
-            webView.goBack();
-        } else {
-            super.onBackPressed();
-        }
-    }
-    @Override protected void onResume() {
-        super.onResume();
-        refreshPendingBanner();
-
+        if (errorPanel.getVisibility() == View.VISIBLE) { super.onBackPressed(); return; }
+        webView.evaluateJavascript("Boolean(window.__weupWheelClose && window.__weupWheelClose())", result -> {
+            if ("true".equals(result)) return;
+            if (webView.canGoBack()) webView.goBack();
+            else MainActivity.super.onBackPressed();
+        });
     }
     @Override protected void onDestroy() {
         if (uploadCallback != null) {
