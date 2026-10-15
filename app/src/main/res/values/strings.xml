@@ -8,4 +8,5 @@
     <string name="download_failed">No se pudo iniciar la descarga</string>
     <string name="no_app">No se encontró una aplicación compatible</string>
     <string name="file_picker_failed">No se pudo abrir el selector de archivos</string>
+    <string name="widget_description">Captura rápida y acceso a notas guardadas localmente</string>
 </resources>

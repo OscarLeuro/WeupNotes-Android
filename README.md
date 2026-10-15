@@ -1,66 +1,29 @@
-# WeupNotes — app Android (base web v1.0.8)
+# WeupNotes Android v1.1.0 (vista web + captura offline)
 
-**Autor y propietario del proyecto: Weupperu.com**
+Autoría y producto: **Weupperu.com**.
 
-Este proyecto crea un instalador Android (APK) conectado a `https://notas.weupdevelopers.com/`.
-Usa la misma app, usuarios, sesiones, libretas y notas del servidor web. La etiqueta de
-versión 1.0.8 hace referencia a la base web declarada para preparar este proyecto. El
-contenido que muestra siempre es **la versión que esté efectivamente desplegada** en
-el servidor: la APK no contiene el código ni una instantánea offline de WeupNotes.
+La pantalla web está conectada exclusivamente por HTTPS a `https://notas.weupdevelopers.com/`. Conserva inicio de sesión, perfiles y libretas de la versión que esté desplegada en el servidor. No se distribuyen contraseñas ni claves privadas.
 
-## Funciones nativas incluidas
+## Novedades Android v1.1.0
 
-- Icono y lanzador WeupNotes; ejecución a pantalla completa de contenido (sin barra del navegador).
-- Navegación y atrás de Android, sesión persistente mediante cookies y almacenamiento web.
-- Selector de archivos para adjuntos; permisos de micrófono/cámara solicitados solo cuando
-  la página de confianza los necesita.
-- Barra de carga; mensaje y botón Reintentar para errores de conexión.
-- Enlaces externos abiertos con sus apps; HTTPS obligatorio para el servidor principal.
-- Descarga de archivos HTTPS con sesión autenticada, mediante DownloadManager.
+- Menú rápido flotante inferior derecho con 4 acciones en arco: Nota, Espacio, Libreta y Buscar. Pulsación normal: abre la rueda, se toca una opción. Pulsación sostenida: deslizar el dedo hasta una opción y soltar para ejecutarla. Botón atrás o tocar fuera cierra la rueda. Atributos accesibles para TalkBack.
+- Cuando la web está cargada, el botón intenta activar los controles visibles del sitio mediante etiquetas accesibles y texto; la página también recibe `weupnotes:native-action` con `detail.action`: `note`, `space`, `notebook` o `search` para que la versión web implemente un enlace estable al integrarse. **No se inventan URLs ni llamadas POST al servidor**. Si no se reconoce una opción, el usuario ve el aviso correspondiente, o pasa a captura/búsqueda local para Nota/Buscar.
+- Captura y edición de borradores **locales** incluso sin Internet. Almacenamiento cifrado mediante Android Keystore, AES-256-GCM y archivo de escritura atómica; título/cuerpo, guardar, volver a editar, buscar, copiar, compartir y eliminar con confirmación. Los borradores se distinguen claramente de notas de servidor.
+- Acceso "Locales" en la app, incluido en pantalla de fallo de conexión.
+- Widget de inicio 4×2: cuenta de notas locales, captura rápida, buscar y ver todas. El título de la última nota aparece **solo si la persona activa voluntariamente la vista previa** en la pantalla Mis notas locales; inicialmente se oculta por privacidad.
 
-**Limitaciones conocidas:** requiere Internet para consultar/modificar notas; no incorpora
-caché offline ni sincronización nativa independiente. El diseño móvil es el CSS responsive
-que sirva la web. Las descargas `blob:` generadas solo en memoria por JavaScript no son
-compatibles con DownloadManager. No se ha validado la app contra el servidor en vivo ni
-contra un dispositivo físico desde este entorno de preparación.
+## Alcance REAL de la sincronización
 
-## Compilación sencilla con Android Studio
+**Esta versión no sincroniza aún los borradores locales con las notas del servidor y tampoco descarga notas del servidor para editarlas offline.** El código entregado inicialmente era solo un contenedor WebView y no incluía el backend, su API, rutas de autenticación, modelo de versiones ni sincronización. No se envían datos a rutas supuestas ni se borran borradores bajo una falsa confirmación. Para completar sincronización bidireccional es imprescindible adaptar y verificar la última versión COMPLETA del backend WeupNotes, no solo cambiar el APK. Consulta `CONTRATO-SINCRONIZACION.md`.
 
-1. Instalar Android Studio reciente y abrir esta carpeta (la que contiene `settings.gradle`).
-2. Permitir que descargue Android SDK 35, Android Gradle Plugin 8.7.3 y Gradle 8.9.
-3. Usar JDK 17.
-4. Menú **Build > Build Bundle(s) / APK(s) > Build APK(s)**.
-5. APK en `app/build/outputs/apk/debug/app-debug.apk`. La variante debug se firma
-   automáticamente al compilar y puede instalarse en Android 8.0 o superior.
+Los borradores locales permanecen **solo en este dispositivo** y no forman parte del backup automático (`allowBackup=false`); se perderán si desinstalas la app o borras su almacenamiento. Copiar o compartir permite extraerlos voluntariamente. No desinstales la app cuando contenga borradores sin exportar. No se garantizan acciones online automatizadas hasta integrar eventos estables en la web.
 
-## Compilación online: GitHub Actions (no exige instalar Android Studio)
+## Compilar
 
-1. Crear un repositorio en GitHub y subir el **contenido** de esta carpeta a la raíz;
-   incluir `.github/workflows/crear-apk.yml` (es carpeta oculta).
-2. En pestaña **Actions**, elegir **Compilar WeupNotes Android APK**, luego **Run workflow**.
-3. Al finalizar, abrir la ejecución y descargar el artefacto
-   **WeupNotes-v1.0.8-Android-APK**. El archivo ZIP de Actions contiene el APK firmado
-   automáticamente para instalación directa en Android.
-4. En el teléfono, abrir el APK y autorizar instalaciones desde esa fuente si se solicita.
+Java 17, Gradle 8.9, Android Gradle Plugin 8.7.3, SDK 35. `gradle :app:assembleDebug`. El flujo GitHub Actions genera el APK debug verificando que exista y adjuntándolo en los artefactos de cada ejecución. Android 8.0+ (`minSdk 26`). Identificador `com.weupperu.weupnotes`, `versionCode 110`.
 
-Alternativamente en una máquina con SDK Android y Gradle 8.9 configurados, ejecutar
-`gradle :app:assembleDebug` desde esta carpeta.
+**Firma:** la firma debug de runners distintos puede cambiar de compilación a compilación. Si Android señala conflicto de firma al actualizar, antes de desinstalar conserva/exporta tus borradores. Para versiones de distribución configurar un keystore privado estable por GitHub Secrets, sin subirlo al repositorio. No se garantiza la sustitución directa del APK 1.0.8 de pruebas.
 
-## Publicación / firma de distribución
+## Protección
 
-El APK debug es instalable, pero **no** es apropiado como versión definitiva de tienda.
-Para publicar, generar un keystore propio y Build > Generate Signed Bundle / APK en
-Android Studio, y custodiar la clave privada. No se incluyen contraseñas ni certificados
-privados. El package id es `com.weupperu.weupnotes`; para futuras actualizaciones
-mantener la misma firma y aumentar `versionCode`.
-
-## Cambios de dominio
-
-Si cambia el dominio oficial, actualizar las constantes `HOME` y `TRUSTED_HOST` en
-`app/src/main/java/com/weupperu/weupnotes/MainActivity.java` y compilar una versión nueva.
-
-## Condiciones de seguridad
-
-No se guarda ningún password en el código. Login y notas provienen de la web por HTTPS.
-Solo el dominio oficial se abre dentro del WebView. Cámara/micrófono no se conceden a
-otros orígenes. Debug WebView se activa únicamente en compilaciones de desarrollo.
+WebView solo carga la URL oficial dentro de la app. Sin SSL inválido, navegación externa en navegador, solicitud de permisos cámara/micrófono únicamente bajo el dominio de confianza y solo cuando se necesitan. Archivo local AES-GCM, sin respaldo automático y sin vista previa de widget por defecto.

@@ -10,8 +10,8 @@ android {
         applicationId 'com.weupperu.weupnotes'
         minSdk 26
         targetSdk 34
-        versionCode 108
-        versionName '1.0.8'
+        versionCode 110
+        versionName '1.1.0'
         resConfigs 'es'
     }
 

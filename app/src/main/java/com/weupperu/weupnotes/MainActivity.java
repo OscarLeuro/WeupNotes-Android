@@ -20,6 +20,10 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Message;
 import android.view.Gravity;
+import android.view.MotionEvent;
+import android.app.AlertDialog;
+import android.content.res.ColorStateList;
+import java.util.Locale;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
@@ -61,6 +65,17 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> uploadCallback;
     private PermissionRequest mediaRequest;
     private boolean mainFrameError = false;
+    private FrameLayout wheelHost;
+    private View wheelShade;
+    private Button wheelButton;
+    private final Button[] wheelOptions = new Button[4];
+    private final float[] wheelDx = new float[4];
+    private final float[] wheelDy = new float[4];
+    private boolean wheelOpen;
+    private boolean startedWheelOpen;
+    private int highlighted = -1;
+    private float wheelDownX, wheelDownY;
+
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -71,6 +86,7 @@ public class MainActivity extends Activity {
         setContentView(root);
         initWebView();
         initOverlay();
+        initWheel();
         if (state != null) {
             webView.restoreState(state);
             if (webView.getUrl() == null) webView.loadUrl(HOME);
@@ -132,6 +148,7 @@ public class MainActivity extends Activity {
                 root.removeView(progress);
                 root.addView(progress);
                 errorPanel.bringToFront();
+                wheelHost.bringToFront();
                 showError();
                 return true;
             }
@@ -246,8 +263,163 @@ public class MainActivity extends Activity {
             errorPanel.setVisibility(View.GONE);
             webView.loadUrl(HOME);
         });
+        errorPanel.addView(buttonForOffline());
         errorPanel.setVisibility(View.GONE);
         root.addView(errorPanel, new FrameLayout.LayoutParams(-1, -1));
+    }
+
+    private Button buttonForOffline() {
+        Button local = new Button(this);
+        local.setText("Mis notas locales"); local.setAllCaps(false);
+        local.setTextColor(getColor(R.color.brand));
+        local.setOnClickListener(v -> openLocal(OfflineActivity.ACTION_LIST));
+        return local;
+    }
+
+    private android.graphics.drawable.GradientDrawable circle(int color) {
+        android.graphics.drawable.GradientDrawable shape = new android.graphics.drawable.GradientDrawable();
+        shape.setColor(color); shape.setCornerRadius(dp(80));
+        return shape;
+    }
+
+    /** A native pie-style quick action menu, supporting hold-drag-release and regular taps. */
+    private void initWheel() {
+        wheelHost = new FrameLayout(this);
+        root.addView(wheelHost, new FrameLayout.LayoutParams(-1, -1));
+        wheelShade = new View(this); wheelShade.setBackgroundColor(0x44000000);
+        wheelShade.setOnClickListener(v -> closeWheel());
+        wheelHost.addView(wheelShade, new FrameLayout.LayoutParams(-1, -1));
+        wheelShade.setVisibility(View.GONE);
+        Button locals = new Button(this);
+        locals.setText("▤ Locales"); locals.setAllCaps(false); locals.setTextSize(13);
+        locals.setTextColor(getColor(R.color.brand));
+        locals.setBackground(circle(getColor(R.color.light_brand)));
+        locals.setElevation(dp(5)); locals.setContentDescription("Ver notas locales sin conexión");
+        FrameLayout.LayoutParams localPosition = new FrameLayout.LayoutParams(dp(102),dp(43),Gravity.START|Gravity.BOTTOM);
+        localPosition.leftMargin=dp(16); localPosition.bottomMargin=dp(26);
+        wheelHost.addView(locals,localPosition);
+        locals.setOnClickListener(v -> { closeWheel(); openLocal(OfflineActivity.ACTION_LIST); });
+        String[] names = {"✎\nNota", "▣\nEspacio", "▤\nLibreta", "⌕\nBuscar"};
+        String[] descriptions = {"Agregar una nota", "Agregar un nuevo espacio",
+            "Agregar una nueva libreta", "Buscar"};
+        for (int i=0; i<4; i++) {
+            final int which = i;
+            double angle = Math.toRadians(180 + 30 * i);
+            wheelDx[i] = (float)(Math.cos(angle)*dp(143));
+            wheelDy[i] = (float)(Math.sin(angle)*dp(143));
+            Button option = new Button(this);
+            option.setText(names[i]); option.setTextSize(12); option.setAllCaps(false);
+            option.setTextColor(Color.WHITE); option.setBackground(circle(getColor(R.color.brand)));
+            option.setElevation(dp(6)); option.setContentDescription(descriptions[i]);
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(74),dp(74),Gravity.END|Gravity.BOTTOM);
+            lp.rightMargin = Math.round(dp(10) - wheelDx[i]);
+            lp.bottomMargin = Math.round(dp(12) - wheelDy[i]);
+            wheelHost.addView(option,lp);
+            option.setOnClickListener(v -> { closeWheel(); activate(which); });
+            option.setVisibility(View.GONE); wheelOptions[i] = option;
+        }
+        wheelButton = new Button(this);
+        wheelButton.setText("+"); wheelButton.setTextSize(29); wheelButton.setTextColor(Color.WHITE);
+        wheelButton.setAllCaps(false); wheelButton.setBackground(circle(getColor(R.color.brand)));
+        wheelButton.setElevation(dp(9)); wheelButton.setContentDescription("Acciones rápidas");
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(58),dp(58),Gravity.END|Gravity.BOTTOM);
+        lp.rightMargin=dp(18); lp.bottomMargin=dp(20);
+        wheelHost.addView(wheelButton,lp);
+        wheelButton.setOnClickListener(v -> { if (wheelOpen) closeWheel(); else openWheel(); });
+        wheelButton.setOnTouchListener((v,event) -> {
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    startedWheelOpen = wheelOpen;
+                    wheelDownX=event.getRawX(); wheelDownY=event.getRawY();
+                    if (!wheelOpen) openWheel();
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    float offsetX=event.getRawX()-wheelDownX;
+                    float offsetY=event.getRawY()-wheelDownY;
+                    int best=-1; float distance=dp(47);
+                    for (int i=0;i<4;i++) {
+                        float dx=offsetX-wheelDx[i], dy=offsetY-wheelDy[i];
+                        float d=(float)Math.sqrt(dx*dx+dy*dy);
+                        if (d<distance) { distance=d; best=i; }
+                    }
+                    highlight(best);
+                    return true;
+                case MotionEvent.ACTION_UP:
+                    int chosen=highlighted;
+                    if (chosen>=0) { closeWheel(); v.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY); activate(chosen); }
+                    else if (startedWheelOpen) closeWheel();
+                    highlight(-1);
+                    v.sendAccessibilityEvent(android.view.accessibility.AccessibilityEvent.TYPE_VIEW_CLICKED);
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
+                    highlight(-1); if (!startedWheelOpen) closeWheel(); return true;
+            }
+            return false;
+        });
+    }
+    private void openWheel() {
+        wheelOpen=true;
+        wheelShade.setVisibility(View.VISIBLE);
+        for(Button b: wheelOptions) b.setVisibility(View.VISIBLE);
+        wheelButton.setText("×"); wheelButton.setContentDescription("Cerrar acciones rápidas");
+    }
+    private void closeWheel() {
+        wheelOpen=false;
+        wheelShade.setVisibility(View.GONE);
+        for(Button b: wheelOptions) b.setVisibility(View.GONE);
+        wheelButton.setText("+"); wheelButton.setContentDescription("Acciones rápidas");
+        highlight(-1);
+    }
+    private void highlight(int selected) {
+        highlighted=selected;
+        for (int i=0;i<wheelOptions.length;i++) {
+            Button b=wheelOptions[i]; boolean active=i==selected;
+            b.setScaleX(active?1.17f:1f); b.setScaleY(active?1.17f:1f);
+            b.setBackground(circle(active?getColor(R.color.ink):getColor(R.color.brand)));
+        }
+    }
+    private void openLocal(String action) {
+        Intent intent = new Intent(this, OfflineActivity.class);
+        intent.setAction(action); startActivity(intent);
+    }
+    private boolean webReady() {
+        String url=webView.getUrl();
+        return hasNetwork() && !mainFrameError && url!=null && isTrusted(Uri.parse(url));
+    }
+    private void activate(int action) {
+        if (action==0) {
+            webAction("note", ()->openLocal(OfflineActivity.ACTION_NEW));
+        } else if(action==1) {
+            webAction("space", ()->unavailable("La creación de espacios requiere abrir la web con conexión. Usa el botón Crear espacio de WeupNotes."));
+        } else if(action==2) {
+            webAction("notebook", ()->unavailable("La creación de libretas requiere abrir la web con conexión. Usa el botón Crear libreta de WeupNotes."));
+        } else {
+            webAction("search", ()->openLocal(OfflineActivity.ACTION_SEARCH));
+        }
+    }
+    private void unavailable(String message) {
+        new AlertDialog.Builder(this).setTitle("Acción en WeupNotes web")
+            .setMessage(message).setPositiveButton("Entendido",null).show();
+    }
+    /** Try the actual visible controls, never invent undocumented POST routes. */
+    private void webAction(String action, Runnable fallback) {
+        if (!webReady()) { fallback.run(); return; }
+        // Dispatching this event lets the server-side mobile shell provide a stable hook later.
+        String js="(function(){"+
+            "const a='"+action+"';document.dispatchEvent(new CustomEvent('weupnotes:native-action',{detail:{action:a}}));"+
+            "const norm=s=>(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();"+
+            "if(a==='search'){let x=document.querySelector('input[type=search], input[aria-label*=Buscar], input[placeholder*=Buscar]');"+
+            "if(x){x.focus();x.click();return true;}}"+
+            "const rx={note:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?nota)/,"+
+            "space:/((nuevo?|crear|agregar|anadir)\\s+(un?\\s+)?espacio)/,"+
+            "notebook:/((nueva?|crear|agregar|anadir)\\s+(una?\\s+)?libreta)/,"+
+            "search:/buscar/}[a];"+
+            "if(!rx)return false;const xs=Array.from(document.querySelectorAll('button,[role=button],a'));"+
+            "const el=xs.find(e=>e.getClientRects().length&&rx.test(norm([e.getAttribute('aria-label'),e.getAttribute('title'),e.innerText].filter(Boolean).join(' '))));"+
+            "if(el){el.click();return true;}return false;})()";
+        webView.evaluateJavascript(js, result -> {
+            if (!"true".equals(result)) fallback.run();
+        });
     }
 
     private boolean isTrusted(Uri uri) {
@@ -386,6 +558,7 @@ public class MainActivity extends Activity {
         super.onSaveInstanceState(outState);
     }
     @Override public void onBackPressed() {
+        if (wheelOpen) { closeWheel(); return; }
         if (errorPanel.getVisibility() == View.VISIBLE) {
             super.onBackPressed();
         } else if (webView.canGoBack()) {
