@@ -19,12 +19,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Configurar SDK Android
-        uses: android-actions/setup-android@v3
-      - name: Instalar Android SDK
+      - name: Instalar SDK Android 35
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="$(command -v sdkmanager)"; fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
       - name: Configurar Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
