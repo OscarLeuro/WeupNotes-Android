@@ -36,7 +36,7 @@ public class NotesWidget extends AppWidgetProvider {
         for (int id : ids) {
             RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_notes);
             views.setTextViewText(R.id.widget_count,
-                count == -1 ? "Notas locales no disponibles" : count == 1 ? "1 nota local" : count + " notas locales");
+                count == -1 ? "Notas no disponibles" : count == 1 ? "1 cambio sin guardar" : count + " cambios sin guardar");
             views.setTextViewText(R.id.widget_preview,
                 preview == null ? "Vista previa oculta por privacidad" :
                 (preview.isEmpty() ? "Sin título" : preview));

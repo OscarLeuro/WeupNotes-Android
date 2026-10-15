@@ -46,6 +46,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import java.util.List;
 
 /**
@@ -65,6 +68,8 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> uploadCallback;
     private PermissionRequest mediaRequest;
     private boolean mainFrameError = false;
+    private TextView pendingBanner;
+    private boolean offlineOpenedForFailure = false;
     private FrameLayout wheelHost;
     private View wheelShade;
     private Button wheelButton;
@@ -87,6 +92,8 @@ public class MainActivity extends Activity {
         initWebView();
         initOverlay();
         initWheel();
+        initPendingBanner();
+        refreshPendingBanner();
         if (state != null) {
             webView.restoreState(state);
             if (webView.getUrl() == null) webView.loadUrl(HOME);
@@ -126,6 +133,7 @@ public class MainActivity extends Activity {
             }
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 mainFrameError = false;
+                offlineOpenedForFailure = false;
                 errorPanel.setVisibility(View.GONE);
                 progress.setVisibility(View.VISIBLE);
             }
@@ -133,6 +141,11 @@ public class MainActivity extends Activity {
                 progress.setVisibility(View.GONE);
                 if (mainFrameError) errorPanel.setVisibility(View.VISIBLE);
                 CookieManager.getInstance().flush();
+                if (!mainFrameError && isTrusted(Uri.parse(url))) {
+                    injectWebWheel();
+                    wheelHost.setVisibility(View.GONE);
+                }
+                refreshPendingBanner();
             }
             @Override public void onReceivedError(WebView view, WebResourceRequest req, WebResourceError error) {
                 if (req.isForMainFrame()) showError();
@@ -263,17 +276,74 @@ public class MainActivity extends Activity {
             errorPanel.setVisibility(View.GONE);
             webView.loadUrl(HOME);
         });
-        errorPanel.addView(buttonForOffline());
+        // La pantalla de notas se abre directamente al perder conexión; no hay botón «Locales».
         errorPanel.setVisibility(View.GONE);
         root.addView(errorPanel, new FrameLayout.LayoutParams(-1, -1));
     }
 
-    private Button buttonForOffline() {
-        Button local = new Button(this);
-        local.setText("Mis notas locales"); local.setAllCaps(false);
-        local.setTextColor(getColor(R.color.brand));
-        local.setOnClickListener(v -> openLocal(OfflineActivity.ACTION_LIST));
-        return local;
+    /** Topbar contabiliza operaciones locales aún no confirmadas por el servidor. */
+    private void initPendingBanner() {
+        pendingBanner = new TextView(this);
+        pendingBanner.setTextColor(Color.WHITE);
+        pendingBanner.setTextSize(12);
+        pendingBanner.setGravity(Gravity.CENTER);
+        pendingBanner.setTypeface(null, Typeface.BOLD);
+        pendingBanner.setContentDescription("Cambios pendientes de sincronizar, tocar para revisar");
+        pendingBanner.setOnClickListener(v -> onPendingClicked());
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1,dp(31),Gravity.TOP);
+        root.addView(pendingBanner,lp);
+        pendingBanner.setVisibility(View.GONE);
+    }
+    private void refreshPendingBanner() {
+        if (pendingBanner == null) return;
+        int pending;
+        try { pending = OfflineStore.all(this).size(); }
+        catch (Exception e) { pending = -1; }
+        boolean offline = !hasNetwork() || mainFrameError;
+        pendingBanner.setVisibility(offline || pending != 0 ? View.VISIBLE : View.GONE);
+        pendingBanner.setBackgroundColor(themeColor());
+        pendingBanner.setText(pending < 0 ? "Notas pendientes: no fue posible leerlas" :
+            pending + (pending==1 ? " cambio sin guardar" : " cambios sin guardar") +
+            (offline ? "  ·  Sin conexión" : "  ·  Pendiente de sincronizar"));
+        FrameLayout.LayoutParams webLp = (FrameLayout.LayoutParams)webView.getLayoutParams();
+        webLp.topMargin = pendingBanner.getVisibility()==View.VISIBLE ? dp(31) : 0;
+        webView.setLayoutParams(webLp);
+        pendingBanner.bringToFront();
+    }
+    private int themeColor() {
+        return getSharedPreferences("appearance", MODE_PRIVATE).getInt("accent", getColor(R.color.brand));
+    }
+    private void onPendingClicked() {
+        if (!hasNetwork() || mainFrameError) {
+            openLocal(OfflineActivity.ACTION_LIST);
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Cambios guardados en este teléfono")
+            .setMessage("Hay notas protegidas en el dispositivo que todavía no se han enviado al servidor. " +
+                "La sincronización segura necesita habilitar las revisiones y la API en WeupNotes web. " +
+                "No se borrará ningún cambio ni se marcará como sincronizado sin confirmación del servidor.")
+            .setPositiveButton("Ver mis notas", (d,w) -> openLocal(OfflineActivity.ACTION_LIST))
+            .setNegativeButton("Cerrar",null).show();
+    }
+    /** Inyecta acciones dentro de la web: clona los iconos reales del sidebar y lee el color del tema. */
+    private void injectWebWheel() {
+        try (InputStream in = getAssets().open("weup-wheel.js"); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] chunk = new byte[4096]; int n;
+            while ((n=in.read(chunk))>=0) out.write(chunk,0,n);
+            webView.evaluateJavascript(out.toString("UTF-8"), ignored -> {});
+            webView.evaluateJavascript("(function(){const s=getComputedStyle(document.documentElement);const b=getComputedStyle(document.body);"+
+                "const vars=['--theme-primary','--theme-color','--color-primary','--primary-color','--primary','--accent-color','--accent','--brand-color','--brand','--weup-primary'];"+
+                "for(const k of vars){const v=s.getPropertyValue(k).trim()||b.getPropertyValue(k).trim();if(v && (v[0]==='#'||v.startsWith('rgb')))return v;}"+
+                "const a=document.querySelector('aside .active,nav .active,[data-sidebar] .active');return a?getComputedStyle(a).backgroundColor:'';})()", value -> {
+                    try { String css = new org.json.JSONTokener(value).nextValue().toString();
+                        if (css.startsWith("#") || css.startsWith("rgb")) {
+                            int parsed = Color.parseColor(css);
+                            getSharedPreferences("appearance",MODE_PRIVATE).edit().putInt("accent",parsed).apply();
+                            refreshPendingBanner();
+                        }
+                    } catch (Exception ignored) {};
+                });
+        } catch (Exception ignored) { /* La web funciona aunque falte el recurso opcional. */ }
     }
 
     private android.graphics.drawable.GradientDrawable circle(int color) {
@@ -290,16 +360,7 @@ public class MainActivity extends Activity {
         wheelShade.setOnClickListener(v -> closeWheel());
         wheelHost.addView(wheelShade, new FrameLayout.LayoutParams(-1, -1));
         wheelShade.setVisibility(View.GONE);
-        Button locals = new Button(this);
-        locals.setText("▤ Locales"); locals.setAllCaps(false); locals.setTextSize(13);
-        locals.setTextColor(getColor(R.color.brand));
-        locals.setBackground(circle(getColor(R.color.light_brand)));
-        locals.setElevation(dp(5)); locals.setContentDescription("Ver notas locales sin conexión");
-        FrameLayout.LayoutParams localPosition = new FrameLayout.LayoutParams(dp(102),dp(43),Gravity.START|Gravity.BOTTOM);
-        localPosition.leftMargin=dp(16); localPosition.bottomMargin=dp(26);
-        wheelHost.addView(locals,localPosition);
-        locals.setOnClickListener(v -> { closeWheel(); openLocal(OfflineActivity.ACTION_LIST); });
-        String[] names = {"✎\nNota", "▣\nEspacio", "▤\nLibreta", "⌕\nBuscar"};
+        String[] names = {"＋\nNota", "▦\nEspacio", "▤\nLibreta", "⚲\nBuscar"};
         String[] descriptions = {"Agregar una nota", "Agregar un nuevo espacio",
             "Agregar una nueva libreta", "Buscar"};
         for (int i=0; i<4; i++) {
@@ -308,8 +369,8 @@ public class MainActivity extends Activity {
             wheelDx[i] = (float)(Math.cos(angle)*dp(143));
             wheelDy[i] = (float)(Math.sin(angle)*dp(143));
             Button option = new Button(this);
-            option.setText(names[i]); option.setTextSize(12); option.setAllCaps(false);
-            option.setTextColor(Color.WHITE); option.setBackground(circle(getColor(R.color.brand)));
+            option.setText(names[i]); option.setTextSize(17); option.setAllCaps(false);
+            option.setTextColor(Color.WHITE); option.setBackground(circle(themeColor()));
             option.setElevation(dp(6)); option.setContentDescription(descriptions[i]);
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(74),dp(74),Gravity.END|Gravity.BOTTOM);
             lp.rightMargin = Math.round(dp(10) - wheelDx[i]);
@@ -320,7 +381,7 @@ public class MainActivity extends Activity {
         }
         wheelButton = new Button(this);
         wheelButton.setText("+"); wheelButton.setTextSize(29); wheelButton.setTextColor(Color.WHITE);
-        wheelButton.setAllCaps(false); wheelButton.setBackground(circle(getColor(R.color.brand)));
+        wheelButton.setAllCaps(false); wheelButton.setBackground(circle(themeColor()));
         wheelButton.setElevation(dp(9)); wheelButton.setContentDescription("Acciones rápidas");
         FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(dp(58),dp(58),Gravity.END|Gravity.BOTTOM);
         lp.rightMargin=dp(18); lp.bottomMargin=dp(20);
@@ -375,7 +436,7 @@ public class MainActivity extends Activity {
         for (int i=0;i<wheelOptions.length;i++) {
             Button b=wheelOptions[i]; boolean active=i==selected;
             b.setScaleX(active?1.17f:1f); b.setScaleY(active?1.17f:1f);
-            b.setBackground(circle(active?getColor(R.color.ink):getColor(R.color.brand)));
+            b.setBackground(circle(active?getColor(R.color.ink):themeColor()));
         }
     }
     private void openLocal(String action) {
@@ -428,6 +489,12 @@ public class MainActivity extends Activity {
     }
 
     private boolean routeNavigation(Uri uri) {
+        if ("weupnotes-action".equalsIgnoreCase(uri.getScheme())) {
+            String name=uri.getHost();
+            int index="note".equals(name)?0:"space".equals(name)?1:"notebook".equals(name)?2:"search".equals(name)?3:-1;
+            if (index>=0) activate(index);
+            return true;
+        }
         if (isTrusted(uri)) return false;
         String scheme = uri.getScheme();
         if (scheme == null) return true;
@@ -526,6 +593,13 @@ public class MainActivity extends Activity {
 
     private void showError() {
         mainFrameError = true;
+        refreshPendingBanner();
+        wheelHost.setVisibility(View.VISIBLE);
+        if (!offlineOpenedForFailure) {
+            offlineOpenedForFailure=true;
+            // Entrada directa al listado/editor: no se obliga a ir a otra zona «local».
+            openLocal(OfflineActivity.ACTION_LIST);
+        }
         errorPanel.setVisibility(View.VISIBLE);
         errorPanel.bringToFront();
         progress.setVisibility(View.GONE);
@@ -566,6 +640,11 @@ public class MainActivity extends Activity {
         } else {
             super.onBackPressed();
         }
+    }
+    @Override protected void onResume() {
+        super.onResume();
+        refreshPendingBanner();
+
     }
     @Override protected void onDestroy() {
         if (uploadCallback != null) {
