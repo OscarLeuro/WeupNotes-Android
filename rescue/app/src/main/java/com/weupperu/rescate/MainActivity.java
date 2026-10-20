@@ -647,7 +647,8 @@ public class MainActivity extends Activity {
             c = getContentResolver().query(children, cols, null, null, null);
             if (c == null) return;
             int idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
-            int nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);            int mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
+            int nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+            int mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
             int sizeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE);
             int modCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
             List<String[]> dirs = new ArrayList<>();
