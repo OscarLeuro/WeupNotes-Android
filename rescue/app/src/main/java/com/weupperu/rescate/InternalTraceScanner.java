@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Read-only inventory of accessible shared internal storage. DOES NOT access deleted blocks.
- * Includes hidden files, thumbnails and media whose file extension is wrong or missing.
+ * Only reports still-existing residual COPIES in recognizable trace/cache/backup locations; never ordinary gallery images.
  * Author: Weupperu.com.
  */
 public final class InternalTraceScanner {
@@ -29,7 +29,7 @@ public final class InternalTraceScanner {
     }
     private static final int MAX_FILES_INSPECTED = 120_000;
     private static final int MAX_DEPTH = 25;
-    private static final long MAX_SNIFF = 100L*1024*1024;
+    private static final long MAX_SNIFF = 2L*1024*1024*1024;
     private static final class Node {
         final File f; final int depth;
         Node(File f, int depth) { this.f=f; this.depth=depth; }
@@ -64,18 +64,48 @@ public final class InternalTraceScanner {
             inspected++;
             String path = file.getAbsolutePath().replace('\\','/').toLowerCase(Locale.ROOT);
             String name = file.getName().toLowerCase(Locale.ROOT);
-            boolean residual = path.contains("thumb") || path.contains("cache") || path.contains("trash") ||
-                    name.startsWith(".") || path.contains("backup") || path.contains("sent") || path.contains("temp");
+            // IMPORTANT: do not populate a supposed forensic result list with ordinary
+            // gallery entries. A trace is a STILL-EXISTING copy, never proof of deletion.
+            String reason = residualReason(canonical.substring(rootPath.length()), name);
+            if (reason == null) continue;
             long length=file.length();
             if (length < 96 || length > MAX_SNIFF) continue;
             String mime = sniff(file);
             if (mime == null) continue;
-            listener.onFound(file,mime,residual,residual ? "Copia / miniatura / caché accesible" : "Imagen existente accesible");
+            listener.onFound(file,mime,true,reason);
             matches++;
             if (inspected % 250 == 0 || matches % 15 == 0) listener.onProgress(inspected,matches);
         }
         listener.onProgress(inspected,matches);
         return new Report(inspected,matches,restricted,stop.get(),inspected>=MAX_FILES_INSPECTED || matches>=maxMatches);
+    }
+    /** Only explicitly residual / hidden / backup locations; not ordinary DCIM/Pictures/Movies. */
+    public static String residualReason(String path, String name) {
+        String p = path.replace('\\','/').toLowerCase(Locale.ROOT);
+        String n = name.toLowerCase(Locale.ROOT);
+        // Ignore normal items even if their names contain the word cache/thumb/backup.
+        if (n.startsWith(".trashed-") || n.startsWith(".trashed_") || n.startsWith(".trash-"))
+            return "Archivo físico con nombre de descarte (borrado no verificable)";
+        String[] parts=p.split("/");
+        for (int i=0; i<parts.length-1; i++) {
+            String segment=parts[i];
+            if (segment.equals(".thumbnails") || segment.equals("thumbnails") || segment.equals(".thumb") || segment.equals("thumbs"))
+                return "Miniatura/copia física residual (borrado no verificable)";
+            if (segment.equals(".cache") || segment.equals("cache") || segment.equals("caches") || segment.equals("cached"))
+                return "Copia de caché accesible (borrado no verificable)";
+            if (segment.equals(".trash") || segment.equals(".trashed") || segment.equals("trash") || segment.equals("recycle") || segment.equals("recycler"))
+                return "Copia física en carpeta de descarte (no es espacio libre)";
+            if (segment.equals("lost.dir") || segment.equals("lost+found"))
+                return "Fragmento todavía existente en directorio de recuperación";
+            if (segment.equals("backup") || segment.equals("backups") || segment.equals(".backup"))
+                return "Copia de respaldo todavía existente";
+            if (segment.equals("temp") || segment.equals("tmp") || segment.equals(".temp"))
+                return "Copia temporal todavía existente";
+            if (segment.startsWith(".") && !segment.equals(".") && !segment.equals(".."))
+                return "Archivo dentro de carpeta oculta todavía accesible";
+        }
+        if (n.startsWith(".") && !n.equals(".nomedia")) return "Archivo oculto todavía accesible";
+        return null;
     }
     /** Signature inspection, not an assertion of complete file validity. */
     public static String sniff(File file) {
@@ -88,7 +118,16 @@ public final class InternalTraceScanner {
         if ((h[0]&255)==137 && h[1]==80 && h[2]==78 && h[3]==71 && h[4]==13 && h[5]==10 && h[6]==26 && h[7]==10) return "image/png";
         if (h[0]=='G' && h[1]=='I' && h[2]=='F' && h[3]=='8' && (h[4]=='7'||h[4]=='9') && h[5]=='a') return "image/gif";
         if (h[0]=='R' && h[1]=='I' && h[2]=='F' && h[3]=='F' && h[8]=='W' && h[9]=='E' && h[10]=='B' && h[11]=='P') return "image/webp";
-        if (h[4]=='f' && h[5]=='t' && h[6]=='y' && h[7]=='p' && ((h[8]=='h' && h[9]=='e') || (h[8]=='m' && h[9]=='i'))) return "image/heic";
+        if (h[4]=='f' && h[5]=='t' && h[6]=='y' && h[7]=='p') {
+            String brand=new String(h,8,4,java.nio.charset.StandardCharsets.US_ASCII);
+            if (brand.startsWith("he") || brand.equals("mif1") || brand.equals("msf1")) return "image/heic";
+            if (brand.equals("qt  ")) return "video/quicktime";
+            if (brand.equals("isom") || brand.equals("iso2") || brand.equals("mp41") ||
+                    brand.equals("mp42") || brand.equals("avc1") || brand.equals("M4V ") ||
+                    brand.equals("3gp4") || brand.equals("3gp5") || brand.equals("3gp6") || brand.equals("dash")) return "video/mp4";
+        }
+        if ((h[0]&255)==0x1A && (h[1]&255)==0x45 && (h[2]&255)==0xDF && (h[3]&255)==0xA3)
+            return "video/x-matroska"; // May also be WebM; validate via preview.
         return null;
     }
     private InternalTraceScanner() {}

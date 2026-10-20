@@ -3,6 +3,9 @@ package com.weupperu.rescate;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DatePickerDialog;
+import android.media.MediaMetadataRetriever;
+import android.media.ExifInterface;
 import android.app.PendingIntent;
 import android.content.ContentResolver;
 import android.content.Intent;
@@ -61,6 +64,9 @@ import java.util.zip.ZipEntry;
 import java.util.Enumeration;
 import java.io.OutputStream;
 import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.text.ParseException;
+import java.util.Calendar;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -74,7 +80,7 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Weup Rescue v0.3.1 — Weupperu.com
+ * Weup Rescue v0.4 — Weupperu.com
  * Local, read-only retrieval from accessible storage and signature-carving of an explicitly
  * selected, unencrypted forensic SD-card image. Does not bypass Android filesystem encryption.
  */
@@ -105,6 +111,9 @@ public class MainActivity extends Activity {
     private TextView status, resultCount;
     private EditText searchInput;
     private Spinner typeFilter;
+    private Button sinceButton, untilButton;
+    private long dateFrom = 0, dateUntil = 0; // inclusive day bounds, zero = unrestricted
+
     private Button trashButton, mediaButton, folderButton, rawButton, stopButton, internalButton, bulkButton;
     private final Set<String> selected = new HashSet<>();
     // All UI collections below are accessed only on Android's main thread.
@@ -134,6 +143,7 @@ public class MainActivity extends Activity {
         Uri uri;
         String name, mime, source, location;
         long size, modified;
+        String dateBasis = "Última modificación (NO fecha de eliminación)";
         boolean trashed, hidden;
         File carvedFile;
         long offset = -1;
@@ -209,11 +219,11 @@ public class MainActivity extends Activity {
         TextView brand = text("WEUP  /  RESCUE", 12, ACCENT, true);
         root.addView(brand);
         addSpace(root, 10);
-        TextView title = text("Escaneo forense\nde fotografías.", 29, FG, true);
+        TextView title = text("Búsqueda de copias\ny rastros residuales.", 29, FG, true);
         title.setLineSpacing(dp(1), 1.03f);
         root.addView(title);
         addSpace(root, 10);
-        root.addView(text("Exploración forense local: rastros, miniaturas y copias en el almacenamiento interno accesible; análisis por firmas de una imagen binaria sin cifrar.", 14, MUTED, false));
+        root.addView(text("Busca copias físicas ocultas todavía accesibles; descarta la galería normal. Analiza fotos y vídeos, con miniaturas automáticas y filtro temporal.", 14, MUTED, false));
         addSpace(root, 18);
 
         LinearLayout warning = vertical();
@@ -221,11 +231,11 @@ public class MainActivity extends Activity {
         warning.setPadding(dp(14), dp(13), dp(14), dp(13));
         warning.addView(text("IMPORTANTE", 11, ACCENT, true));
         addSpace(warning, 5);
-        warning.addView(text("El Redmi cifra su memoria interna. Ni el permiso Todos los archivos ni el escaneo por firmas leen bloques ya borrados: se buscan rastros todavía accesibles. No desbloquees el bootloader para intentar recuperarlos; puede borrar los datos.", 13, FG, false));
+        warning.addView(text("Esta APK NO puede leer ni recuperar los sectores de fotos o vídeos borrados definitivamente del almacenamiento interno cifrado. Solo encuentra copias residuales aún existentes, que quizá correspondan a originales eliminados; no puede demostrar cuándo se borraron. Evita desbloquear el bootloader.", 13, FG, false));
         root.addView(warning);
         addSpace(root, 18);
 
-        internalButton = button("⌕  ESCANEO FORENSE INTERNO", ACCENT);
+        internalButton = button("⌕  BUSCAR COPIAS RESIDUALES (SIN GALERÍA)", ACCENT);
         internalButton.setOnClickListener(v -> beginInternalScan());
         root.addView(internalButton, new LinearLayout.LayoutParams(-1, dp(58)));
         addSpace(root, 9);
@@ -287,9 +297,33 @@ public class MainActivity extends Activity {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
                 Arrays.asList("Todos los tipos", "Imágenes", "Vídeos", "Audio", "Documentos", "Otros", "Nombres ocultos"));
         typeFilter.setAdapter(adapter);
-        typeFilter.setSelection(1);
+        typeFilter.setSelection(0);
         typeFilter.setBackground(background(CARD, BORDER, 10));
         root.addView(typeFilter, new LinearLayout.LayoutParams(-1, dp(45)));
+        addSpace(root, 10);
+        root.addView(text("FILTRAR POR FECHA DE CAPTURA (si hay EXIF) O MODIFICACIÓN", 11, MUTED, true));
+        addSpace(root, 5);
+        LinearLayout dates = new LinearLayout(this);
+        dates.setOrientation(LinearLayout.HORIZONTAL);
+        sinceButton = button("Desde: cualquiera", CARD);
+        untilButton = button("Hasta: cualquiera", CARD);
+        dates.addView(sinceButton, new LinearLayout.LayoutParams(0, dp(49), 1f));
+        dates.addView(untilButton, new LinearLayout.LayoutParams(0, dp(49), 1f));
+        root.addView(dates);
+        sinceButton.setOnClickListener(v -> selectDate(true));
+        untilButton.setOnClickListener(v -> selectDate(false));
+        addSpace(root, 5);
+        LinearLayout dateActions = new LinearLayout(this);
+        dateActions.setOrientation(LinearLayout.HORIZONTAL);
+        Button preset = button("Hace 1–3 años", CARD);
+        preset.setOnClickListener(v -> applyOlderPreset());
+        dateActions.addView(preset, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        Button clearDates = button("Limpiar fechas", CARD);
+        clearDates.setOnClickListener(v -> { dateFrom=0; dateUntil=0; updateDateLabels(); visibleResults=PAGE_SIZE; render(); });
+        dateActions.addView(clearDates,new LinearLayout.LayoutParams(0, dp(44), 1f));
+        root.addView(dateActions);
+        addSpace(root, 4);
+        root.addView(text("No es la fecha de eliminación. Los hallazgos sin fecha se ocultan cuando activas un rango.", 11, MUTED, false));
         addSpace(root, 12);
         resultList = vertical();
         root.addView(resultList);
@@ -309,6 +343,42 @@ public class MainActivity extends Activity {
         });
     }
 
+    private static long startOfDay(int y, int month, int day) {
+        Calendar c=Calendar.getInstance(); c.clear(); c.set(y,month,day,0,0,0); return c.getTimeInMillis();
+    }
+    private static long endOfDay(int y, int month, int day) {
+        Calendar c=Calendar.getInstance(); c.clear(); c.set(y,month,day,0,0,0); c.add(Calendar.DAY_OF_MONTH,1);
+        return c.getTimeInMillis()-1;
+    }
+    private String dayText(long ts) {
+        return ts==0 ? "cualquiera" : new SimpleDateFormat("dd/MM/yyyy",new Locale("es","PE")).format(new Date(ts));
+    }
+    private void updateDateLabels() {
+        if (sinceButton!=null) sinceButton.setText("Desde: "+dayText(dateFrom));
+        if (untilButton!=null) untilButton.setText("Hasta: "+dayText(dateUntil));
+    }
+    private void selectDate(boolean start) {
+        Calendar c=Calendar.getInstance();
+        long selected=start?dateFrom:dateUntil;
+        if(selected>0) c.setTimeInMillis(selected);
+        DatePickerDialog dialog = new DatePickerDialog(this,(picker,y,m,d)->{
+            long day=start?startOfDay(y,m,d):endOfDay(y,m,d);
+            if (start) dateFrom=day; else dateUntil=day;
+            updateDateLabels(); visibleResults=PAGE_SIZE; render();
+        },c.get(Calendar.YEAR),c.get(Calendar.MONTH),c.get(Calendar.DAY_OF_MONTH));
+        dialog.show();
+    }
+    private void applyOlderPreset() {
+        Calendar c=Calendar.getInstance(); c.add(Calendar.YEAR,-3);
+        dateFrom=startOfDay(c.get(Calendar.YEAR),c.get(Calendar.MONTH),c.get(Calendar.DAY_OF_MONTH));
+        c=Calendar.getInstance(); c.add(Calendar.YEAR,-1);
+        dateUntil=endOfDay(c.get(Calendar.YEAR),c.get(Calendar.MONTH),c.get(Calendar.DAY_OF_MONTH));
+        updateDateLabels(); visibleResults=PAGE_SIZE; render();
+    }
+    private boolean matchesDate(FoundItem item) {
+        if (dateFrom==0 && dateUntil==0) return true;
+        return item.modified>0 && (dateFrom==0 || item.modified>=dateFrom) && (dateUntil==0 || item.modified<=dateUntil);
+    }
     private String[] missingMediaPermissions() {
         if (Build.VERSION.SDK_INT < 23) return new String[0];
         List<String> ask = new ArrayList<>();
@@ -437,7 +507,7 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
             new AlertDialog.Builder(this)
                 .setTitle("Permiso para escaneo interno")
-                .setMessage("Esta función requiere permitir 'Administrar todos los archivos' para inspeccionar, en solo lectura, imágenes y miniaturas residuales en el almacenamiento COMPARTIDO del Redmi. No da acceso a bloques borrados ni a datos privados de otras aplicaciones. Sin internet, sin eliminación y sin root.")
+                .setMessage("Permite 'Administrar todos los archivos' para buscar COPIAS residuales todavía existentes en el almacenamiento compartido. Se excluyen fotos y vídeos normales de la galería. Esta función NO puede leer fotos/vídeos eliminados definitivamente del espacio libre cifrado, ni datos privados de otras apps.")
                 .setNegativeButton("Cancelar", null)
                 .setPositiveButton("Abrir ajustes", (d,w) -> {
                     Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -485,7 +555,7 @@ public class MainActivity extends Activity {
             cancelInternal.set(false);
             internalRunning = true;
             reset();
-            setBusy(true, "Escaneando firmas JPG/PNG/GIF/WEBP/HEIC y rastros accesibles…");
+            setBusy(true, "Buscando copias residuales de fotos y vídeos, sin incluir la galería…");
             new Thread(() -> {
                 InternalTraceScanner.Report report = null;
                 String error = null;
@@ -496,6 +566,7 @@ public class MainActivity extends Activity {
                         @Override public void onFound(File f, String mime, boolean residual, String reason) {
                             FoundItem item = new FoundItem(Uri.fromFile(f), f.getName(), mime, reason,
                                     f.getParent(), f.length(), f.lastModified(), false, f.getName().startsWith("."));
+                            applyEvidenceDate(item, f);
                             if (add(item)) {
                                 int n = arrivals.incrementAndGet();
                                 if (n == 1 || n % 12 == 0) scheduleInternalRender();
@@ -505,7 +576,7 @@ public class MainActivity extends Activity {
                             inspectedInternal = inspected;
                             if (inspected > 0 && inspected % 2000 == 0) mainHandler.post(() -> {
                                 if (internalRunning && !isFinishing()) status.setText(
-                                        "Archivos revisados: " + inspected + " · imágenes accesibles: " + matches);
+                                        "Archivos revisados: " + inspected + " · copias residuales: " + matches);
                             });
                         }
                     });
@@ -517,7 +588,7 @@ public class MainActivity extends Activity {
                     renderPending=false;
                     if (isFinishing() || isDestroyed()) return;
                     render();
-                    String detail = "Encontradas " + countFound() + " imágenes/copias todavía accesibles";
+                    String detail = "Encontradas " + countFound() + " copias/rastros todavía accesibles; NO imágenes recuperadas del espacio borrado";
                     if (result != null) {
                         detail += " · " + result.inspected + " archivos revisados";
                         if (result.restricted > 0) detail += " · " + result.restricted + " ubicaciones restringidas";
@@ -525,7 +596,7 @@ public class MainActivity extends Activity {
                         if (result.stopped) detail += " · detenido";
                     }
                     if (failure != null) detail += " · Error: " + failure;
-                    detail += ". No es un análisis de sectores borrados; la antigüedad real del borrado no es verificable.";
+                    detail += ". La fecha de borrado no puede verificarse. Si sale cero, no hay evidencia accesible en las rutas revisadas.";
                     setBusy(false,detail);
                 });
             },"weup-internal-traces").start();
@@ -535,6 +606,39 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Original capture date is best evidence for age, never evidence for deletion date. */
+    private void applyEvidenceDate(FoundItem item, File file) {
+        if (item.mime.startsWith("image/")) {
+            try {
+                ExifInterface exif=new ExifInterface(file.getAbsolutePath());
+                String value=exif.getAttribute(ExifInterface.TAG_DATETIME_ORIGINAL);
+                if (value==null) value=exif.getAttribute(ExifInterface.TAG_DATETIME);
+                if (value!=null) {
+                    SimpleDateFormat fmt=new SimpleDateFormat("yyyy:MM:dd HH:mm:ss",Locale.US);
+                    fmt.setLenient(false);
+                    Date d=fmt.parse(value);
+                    if (d!=null && d.getTime()>0 && d.getTime()<=System.currentTimeMillis()+86400000L) {
+                        item.modified=d.getTime(); item.dateBasis="Fecha EXIF de captura (NO eliminación)"; return;
+                    }
+                }
+            } catch (Exception ignored) { }
+        } else if (item.mime.startsWith("video/")) {
+            MediaMetadataRetriever mmr=new MediaMetadataRetriever();
+            try {
+                mmr.setDataSource(file.getAbsolutePath());
+                String value=mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE);
+                if (value!=null && value.length()>=8) {
+                    SimpleDateFormat fmt=new SimpleDateFormat("yyyyMMdd",Locale.US); fmt.setLenient(false);
+                    Date d=fmt.parse(value.substring(0,8));
+                    if (d!=null && d.getTime()>0 && d.getTime()<=System.currentTimeMillis()+86400000L) {
+                        item.modified=d.getTime(); item.dateBasis="Metadato de fecha del vídeo (NO eliminación)"; return;
+                    }
+                }
+            } catch (Exception ignored) { }
+            finally { try { mmr.release(); } catch(Exception ignored){} }
+        }
+        if (item.modified<=0) item.dateBasis="Fecha no disponible";
+    }
     private void chooseBulkTarget() {
         if (selected.isEmpty() || busy) return;
         new AlertDialog.Builder(this).setTitle("Exportar " + selected.size() + " elementos")
@@ -758,10 +862,10 @@ public class MainActivity extends Activity {
         synchronized (this) { snapshot = new ArrayList<>(found); }
         int eligible = 0;
         for (FoundItem item:snapshot) {
-            if (!item.name.toLowerCase(Locale.ROOT).contains(query) || !matchingType(item,filter)) continue;
+            if (!item.name.toLowerCase(Locale.ROOT).contains(query) || !matchingType(item,filter) || !matchesDate(item)) continue;
             eligible++;
             if (shown >= visibleResults) continue;
-            if (item.mime.startsWith("image/")) {
+            if (item.mime.startsWith("image/") || item.mime.startsWith("video/")) {
                 if (imageRow==null || column==3) {
                     imageRow=new LinearLayout(this);
                     imageRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -788,7 +892,8 @@ public class MainActivity extends Activity {
                 name.setEllipsize(android.text.TextUtils.TruncateAt.END);
                 tile.addView(name);
                 tile.addView(text(sizeText(item.size),10,MUTED,false));
-                tile.addView(text(item.carvedFile!=null ? "POR FIRMA" : item.source.contains("Copia") ? "RASTRO ACCESIBLE" : "EXISTENTE",10,ACCENT,true));
+                tile.addView(text(item.carvedFile!=null ? "RECONSTRUIDO POR FIRMA" : lastMode==ScanMode.INTERNAL ? "COPIA EXISTENTE; BORRADO NO VERIFICABLE" : item.trashed ? "EN PAPELERA" : "EXISTENTE",10,ACCENT,true));
+                tile.addView(text(dateText(item.modified),10,MUTED,false));
                 CheckBox check=new CheckBox(this);
                 check.setText("Elegir"); check.setTextSize(11); check.setTextColor(FG);
                 String key=itemKey(item);
@@ -814,6 +919,7 @@ public class MainActivity extends Activity {
                 card.addView(text(item.carvedFile!=null? "RECONSTRUIDO POR FIRMA · VERIFICAR" : item.trashed ? "EN PAPELERA" : "ARCHIVO EXISTENTE",10,ACCENT,true));
                 card.addView(text(item.name,15,FG,true));
                 card.addView(text(item.source + " · " + sizeText(item.size),12,MUTED,false));
+                card.addView(text(dateText(item.modified),11,MUTED,false));
                 LinearLayout actions = new LinearLayout(this);
                 Button preview=button("Vista previa",CARD);
                 preview.setOnClickListener(v -> showPreview(item));
@@ -835,7 +941,7 @@ public class MainActivity extends Activity {
             more.setOnClickListener(v -> { visibleResults += PAGE_SIZE; render(); });
             resultList.addView(more,new LinearLayout.LayoutParams(-1,dp(50)));
         }
-        if (shown==0) resultList.addView(text(snapshot.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.",13,MUTED,false));
+        if (shown==0) resultList.addView(text(snapshot.isEmpty() ? "No se encontraron copias accesibles. No significa que sea posible recuperar originales ya eliminados." : "Ningún archivo coincide con los filtros. Las fechas de archivos reconstruidos sin metadatos pueden ser desconocidas.",13,MUTED,false));
     }
 
     /** One decoding task per image; all visible copies of a thumbnail share the result. */
@@ -853,6 +959,21 @@ public class MainActivity extends Activity {
         previews.execute(() -> {
             Bitmap bmp=null;
             try {
+                if (item.mime.startsWith("video/")) {
+                    MediaMetadataRetriever retriever=new MediaMetadataRetriever();
+                    try {
+                        if (item.carvedFile!=null) retriever.setDataSource(item.carvedFile.getAbsolutePath());
+                        else if (item.uri!=null && "file".equals(item.uri.getScheme())) retriever.setDataSource(item.uri.getPath());
+                        else retriever.setDataSource(this,item.uri);
+                        Bitmap frame=retriever.getFrameAtTime(-1,MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+                        if (frame!=null) {
+                            int w=frame.getWidth(), h=frame.getHeight();
+                            float ratio=Math.min(1f,280f/Math.max(w,h));
+                            bmp=ratio<1 ? Bitmap.createScaledBitmap(frame,Math.max(1,Math.round(w*ratio)),Math.max(1,Math.round(h*ratio)),true) : frame;
+                            if (bmp!=frame) frame.recycle();
+                        }
+                    } finally { try { retriever.release(); } catch (Exception ignored) { } }
+                } else {
                 BitmapFactory.Options o=new BitmapFactory.Options();
                 o.inJustDecodeBounds=true;
                 try (InputStream in=openFound(item)) { BitmapFactory.decodeStream(in,null,o); }
@@ -864,6 +985,7 @@ public class MainActivity extends Activity {
                     small.inSampleSize=sample;
                     small.inPreferredConfig=Bitmap.Config.RGB_565;
                     try (InputStream in=openFound(item)) { bmp=BitmapFactory.decodeStream(in,null,small); }
+                }
                 }
             } catch (Exception ignored) { }
             Bitmap result=bmp;
@@ -890,8 +1012,9 @@ public class MainActivity extends Activity {
         String detail = "Origen: " + item.source
                 + "\nUbicación: " + item.location
                 + "\nTamaño: " + sizeText(item.size)
-                + "\nModificación: " + dateText(item.modified)
-                + "\n\nLa modificación no es la fecha del borrado.";
+                + "\nFecha disponible: " + dateText(item.modified)
+                + "\nBase de fecha: " + item.dateBasis
+                + "\n\nEsta copia permanece en almacenamiento; no hay prueba de que su original esté eliminado.";
         AlertDialog.Builder dialog = new AlertDialog.Builder(this)
                 .setTitle(item.name).setMessage(detail).setNegativeButton("Vista previa", (d,which) -> showPreview(item));
         if (item.trashed && Build.VERSION.SDK_INT >= 30) {

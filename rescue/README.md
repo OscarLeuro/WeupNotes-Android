@@ -39,3 +39,10 @@ Sin permiso de Internet. Nada se sube a servidores. La exploración nunca borra 
 - Desduplicación de tareas de miniaturas; resultados devueltos a todas las vistas visibles.
 - Actualización de progreso limitada; validaciones de permiso y acceso antes del escaneo.
 - Mantiene escaneo de rastros accesibles, sin prometer lectura de bloques borrados y cifrados.
+
+## v0.4 — Rastros, vídeo y filtros de fechas
+- El modo interno solo informa de copias todavía existentes en rutas residuales/ocultas, y EXCLUYE fotos y vídeos ordinarios de DCIM, Pictures o Movies. No demuestra eliminación del original.
+- Búsqueda de firmas JPG/PNG/GIF/WEBP/HEIC y MP4/MOV/MKV en las copias accesibles; vista de miniaturas automática, incluida la de vídeo si Android logra decodificar un fotograma.
+- Selector desde/hasta y preselección «Hace 1–3 años». Primero se intenta EXIF/fecha de medios; si no existe, se usa la última modificación. NO es fecha de eliminación; los candidatos sin fecha se excluyen cuando hay filtro.
+- Se conserva el carving sobre una imagen binaria SIN CIFRAR adquirida por separado. No se leen bloques borrados del almacenamiento interno cifrado con una APK convencional.
+- Dos motores independientes con pruebas Java de exclusión de fotos y vídeos normales.
