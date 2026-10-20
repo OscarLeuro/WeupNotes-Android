@@ -21,6 +21,16 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Environment;
+import android.provider.Settings;
+import android.util.LruCache;
+import android.widget.CheckBox;
+import java.lang.ref.WeakReference;
+import java.util.ArrayDeque;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.security.MessageDigest;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.text.Editable;
@@ -61,7 +71,7 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Weup Rescue v0.2 — Weupperu.com
+ * Weup Rescue v0.3 — Weupperu.com
  * Local, read-only retrieval from accessible storage and signature-carving of an explicitly
  * selected, unencrypted forensic SD-card image. Does not bypass Android filesystem encryption.
  */
@@ -71,6 +81,9 @@ public class MainActivity extends Activity {
     private static final int REQ_SAVE = 503;
     private static final int REQ_RESTORE = 504;
     private static final int REQ_IMAGE = 505;
+    private static final int REQ_ALL_FILES = 506;
+    private static final int REQ_BULK = 507;
+    private static final int REQ_REPORT = 508;
     private static final int MAX_RESULTS = 700;
     private static final int MAX_DEPTH = 9;
 
@@ -88,7 +101,12 @@ public class MainActivity extends Activity {
     private TextView status, resultCount;
     private EditText searchInput;
     private Spinner typeFilter;
-    private Button trashButton, mediaButton, folderButton, rawButton, stopButton;
+    private Button trashButton, mediaButton, folderButton, rawButton, stopButton, internalButton, bulkButton;
+    private final Set<String> selected = new HashSet<>();
+    private final ExecutorService previews = Executors.newFixedThreadPool(2);
+    private final LruCache<String,Bitmap> thumbnails = new LruCache<String,Bitmap>(12*1024*1024) {
+        @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount(); }
+    };
     private boolean busy = false;
     private boolean permissionPromptInProgress = false;
     private boolean permissionRequestedOnce = false;
@@ -97,8 +115,11 @@ public class MainActivity extends Activity {
     private ScanMode lastMode = ScanMode.CURRENT;
     private final AtomicBoolean cancelRaw = new AtomicBoolean(false);
     private boolean rawRunning = false;
+    private final AtomicBoolean cancelInternal = new AtomicBoolean(false);
+    private boolean internalRunning = false;
+    private volatile int inspectedInternal = 0;
 
-    private enum ScanMode { TRASH, CURRENT, FOLDER, RAW }
+    private enum ScanMode { TRASH, CURRENT, FOLDER, RAW, INTERNAL }
 
     private static class FoundItem {
         Uri uri;
@@ -179,11 +200,11 @@ public class MainActivity extends Activity {
         TextView brand = text("WEUP  /  RESCUE", 12, ACCENT, true);
         root.addView(brand);
         addSpace(root, 10);
-        TextView title = text("Encuentra lo que aún\npuede recuperarse.", 29, FG, true);
+        TextView title = text("Escaneo forense\nde fotografías.", 29, FG, true);
         title.setLineSpacing(dp(1), 1.03f);
         root.addView(title);
         addSpace(root, 10);
-        root.addView(text("Busca en papelera y carpetas, o analiza una imagen sin cifrar de una tarjeta SD para detectar firmas de archivos borrados no sobrescritos.", 14, MUTED, false));
+        root.addView(text("Exploración forense local: rastros, miniaturas y copias en el almacenamiento interno accesible; análisis por firmas de una imagen binaria sin cifrar.", 14, MUTED, false));
         addSpace(root, 18);
 
         LinearLayout warning = vertical();
@@ -191,11 +212,15 @@ public class MainActivity extends Activity {
         warning.setPadding(dp(14), dp(13), dp(14), dp(13));
         warning.addView(text("IMPORTANTE", 11, ACCENT, true));
         addSpace(warning, 5);
-        warning.addView(text("La búsqueda profunda funciona con imágenes binarias (.img/.dd/.bin) de una microSD sin cifrar. Android NO permite leer el espacio libre de la memoria interna con una APK normal. Un hallazgo puede estar incompleto.", 13, FG, false));
+        warning.addView(text("El Redmi cifra su memoria interna. Ni el permiso Todos los archivos ni el escaneo por firmas leen bloques ya borrados: se buscan rastros todavía accesibles. No desbloquees el bootloader para intentar recuperarlos; puede borrar los datos.", 13, FG, false));
         root.addView(warning);
         addSpace(root, 18);
 
-        trashButton = button("♻  Revisar papelera Android", ACCENT);
+        internalButton = button("⌕  ESCANEO FORENSE INTERNO", ACCENT);
+        internalButton.setOnClickListener(v -> beginInternalScan());
+        root.addView(internalButton, new LinearLayout.LayoutParams(-1, dp(58)));
+        addSpace(root, 9);
+        trashButton = button("♻  Revisar papelera Android", CARD);
         trashButton.setOnClickListener(v -> startMedia(ScanMode.TRASH));
         root.addView(trashButton, new LinearLayout.LayoutParams(-1, dp(54)));
         addSpace(root, 8);
@@ -207,13 +232,16 @@ public class MainActivity extends Activity {
         folderButton.setOnClickListener(v -> chooseFolder());
         root.addView(folderButton, new LinearLayout.LayoutParams(-1, dp(52)));
         addSpace(root, 8);
-        rawButton = button("⌕  Análisis profundo (imagen de microSD)", ACCENT);
+        rawButton = button("▧  Analizar imagen binaria sin cifrar", CARD);
         rawButton.setOnClickListener(v -> selectRawImage());
         root.addView(rawButton, new LinearLayout.LayoutParams(-1, dp(54)));
         addSpace(root, 8);
-        stopButton = button("■  Detener búsqueda profunda", CARD);
+        stopButton = button("■  Detener búsqueda", CARD);
         stopButton.setVisibility(View.GONE);
-        stopButton.setOnClickListener(v -> { cancelRaw.set(true); status.setText("Deteniendo análisis, cerrando archivo en curso…"); });
+        stopButton.setOnClickListener(v -> {
+            cancelRaw.set(true); cancelInternal.set(true);
+            status.setText("Deteniendo búsqueda…");
+        });
         root.addView(stopButton, new LinearLayout.LayoutParams(-1, dp(50)));
         addSpace(root, 8);
         Button infoButton = button("ⓘ  Consejos para archivos muy antiguos", CARD);
@@ -231,6 +259,11 @@ public class MainActivity extends Activity {
         resultCount = text("RESULTADOS · 0", 12, FG, true);
         root.addView(resultCount);
         addSpace(root, 10);
+        bulkButton = button("Guardar seleccionadas (0)", ACCENT);
+        bulkButton.setEnabled(false);
+        bulkButton.setOnClickListener(v -> chooseBulkTarget());
+        root.addView(bulkButton, new LinearLayout.LayoutParams(-1, dp(48)));
+        addSpace(root, 8);
         searchInput = new EditText(this);
         searchInput.setSingleLine(true);
         searchInput.setTextSize(14);
@@ -245,6 +278,7 @@ public class MainActivity extends Activity {
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
                 Arrays.asList("Todos los tipos", "Imágenes", "Vídeos", "Audio", "Documentos", "Otros", "Nombres ocultos"));
         typeFilter.setAdapter(adapter);
+        typeFilter.setSelection(1);
         typeFilter.setBackground(background(CARD, BORDER, 10));
         root.addView(typeFilter, new LinearLayout.LayoutParams(-1, dp(45)));
         addSpace(root, 12);
@@ -327,7 +361,12 @@ public class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
+        if (requestCode == REQ_ALL_FILES) {
+            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) scanInternal();
+            else message("No se habilitó Todos los archivos. El escaneo de rastros internos requiere ese permiso.");
+        } else if (requestCode == REQ_BULK && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            bulkCopy(data.getData());
+        } else if (requestCode == REQ_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
             Uri tree = data.getData();
             try { getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
             catch (Exception ignored) { /* Some providers only give temporary access. */ }
@@ -351,25 +390,145 @@ public class MainActivity extends Activity {
 
     private void setBusy(boolean value, String label) {
         busy = value;
+        internalButton.setEnabled(!value);
+        if (bulkButton != null) bulkButton.setEnabled(!value && !selected.isEmpty());
         trashButton.setEnabled(!value);
         mediaButton.setEnabled(!value);
         folderButton.setEnabled(!value);
         rawButton.setEnabled(!value);
-        stopButton.setVisibility(value && rawRunning ? View.VISIBLE : View.GONE);
+        stopButton.setVisibility(value && (rawRunning || internalRunning) ? View.VISIBLE : View.GONE);
         status.setText(label);
     }
 
     private void reset() {
-        found.clear(); knownUris.clear();
+        found.clear(); knownUris.clear(); selected.clear(); thumbnails.evictAll();
+        if (bulkButton != null) { bulkButton.setText("Guardar seleccionadas (0)"); bulkButton.setEnabled(false); }
         render();
     }
 
     private synchronized boolean add(FoundItem item) {
         if (found.size() >= MAX_RESULTS) return false;
-        String key = item.carvedFile != null ? "carve:" + item.offset : item.uri.toString();
+        String key = itemKey(item);
         if (!knownUris.add(key)) return true;
         found.add(item);
         return found.size() < MAX_RESULTS;
+    }
+
+    private String itemKey(FoundItem item) {
+        return item.carvedFile != null ? "carve:" + item.offset : (item.uri == null ? item.name : item.uri.toString());
+    }
+
+    /** On Android 11+, special all-files permission still excludes private /Android/data and deleted blocks. */
+    private void beginInternalScan() {
+        if (busy) return;
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+            new AlertDialog.Builder(this)
+                .setTitle("Permiso para escaneo interno")
+                .setMessage("Esta función requiere permitir 'Administrar todos los archivos' para inspeccionar, en solo lectura, imágenes y miniaturas residuales en el almacenamiento COMPARTIDO del Redmi. No da acceso a bloques borrados ni a datos privados de otras aplicaciones. Sin internet, sin eliminación y sin root.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Abrir ajustes", (d,w) -> {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                            Uri.parse("package:" + getPackageName()));
+                    try { startActivityForResult(intent, REQ_ALL_FILES); }
+                    catch (Exception e) {
+                        try { startActivityForResult(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION), REQ_ALL_FILES); }
+                        catch (Exception failure) { message("No se pudo abrir el ajuste de almacenamiento."); }
+                    }
+                }).show();
+            return;
+        }
+        scanInternal();
+    }
+
+    private void scanInternal() {
+        if (busy) return;
+        lastMode = ScanMode.INTERNAL;
+        cancelInternal.set(false);
+        internalRunning = true;
+        reset();
+        setBusy(true, "Escaneando firmas JPG/PNG/GIF/WEBP/HEIC y rastros accesibles…");
+        new Thread(() -> {
+            InternalTraceScanner.Report report = null;
+            String error = null;
+            try {
+                report = InternalTraceScanner.scan(Environment.getExternalStorageDirectory(), cancelInternal, MAX_RESULTS,
+                        new InternalTraceScanner.Listener() {
+                    @Override public void onFound(File f, String mime, boolean residual, String reason) {
+                        FoundItem item = new FoundItem(Uri.fromFile(f), f.getName(), mime, reason,
+                                f.getParent(), f.length(), f.lastModified(), false, f.getName().startsWith("."));
+                        add(item);
+                        // Publish progress while scanning, with updates throttled for large result sets.
+                        if (found.size() % 25 == 0) mainHandler.post(() -> { render(); status.setText(
+                            "Rastros accesibles: " + found.size() + " · Buscando más archivos…"); });
+                    }
+                    @Override public void onProgress(int inspected, int matches) {
+                        inspectedInternal = inspected;
+                        if (inspected % 1000 == 0) mainHandler.post(() -> status.setText(
+                            "Archivos revisados: " + inspected + " · imágenes accesibles: " + matches));
+                    }
+                });
+            } catch (Exception e) { error=safe(e.getMessage(),"error de lectura"); }
+            InternalTraceScanner.Report result=report;
+            String failure=error;
+            mainHandler.post(() -> {
+                internalRunning=false;
+                render();
+                String detail = "Encontradas " + found.size() + " imágenes/copias todavía accesibles";
+                if (result != null) {
+                    detail += " · " + result.inspected + " archivos revisados";
+                    if (result.restricted > 0) detail += " · " + result.restricted + " ubicaciones restringidas";
+                    if (result.capReached) detail += " · límite de seguridad alcanzado";
+                    if (result.stopped) detail += " · detenido";
+                }
+                if (failure != null) detail += " · Error: " + failure;
+                detail += ". No es un análisis de sectores borrados; la antigüedad real del borrado no es verificable.";
+                setBusy(false,detail);
+            });
+        },"weup-internal-traces").start();
+    }
+
+    private void chooseBulkTarget() {
+        if (selected.isEmpty() || busy) return;
+        new AlertDialog.Builder(this).setTitle("Exportar " + selected.size() + " elementos")
+                .setMessage("Elige una carpeta de destino, preferiblemente FUERA del medio que se analiza. Cada archivo se copiará sin modificar su origen.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Elegir carpeta", (d,w) -> {
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                    try { startActivityForResult(i,REQ_BULK); }
+                    catch (Exception e) { message("No se pudo abrir el selector de destino."); }
+                }).show();
+    }
+
+    private void bulkCopy(Uri tree) {
+        final ArrayList<FoundItem> targets = new ArrayList<>();
+        for (FoundItem f: found) if (selected.contains(itemKey(f))) targets.add(f);
+        setBusy(true,"Exportando selección…");
+        new Thread(() -> {
+            int saved=0, failed=0;
+            try {
+                Uri directory=DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+                for (int idx=0; idx<targets.size(); idx++) {
+                    FoundItem item=targets.get(idx);
+                    try {
+                        String safeName = String.format(Locale.ROOT,"%03d_",idx+1) + item.name.replace('/', '_').replace('\\','_');
+                        Uri dest = DocumentsContract.createDocument(getContentResolver(),directory,item.mime,safeName);
+                        if (dest==null) throw new IOException("No se pudo crear destino");
+                        try (InputStream in=openFound(item); OutputStream out=getContentResolver().openOutputStream(dest,"w")) {
+                            if (out == null) throw new IOException("Destino no disponible");
+                            byte[] data=new byte[65536]; int n;
+                            while ((n=in.read(data))!=-1) out.write(data,0,n);
+                        }
+                        saved++;
+                    } catch (Exception e) { failed++; }
+                    int done = saved, bad=failed;
+                    mainHandler.post(() -> status.setText("Copiados " + done + "/" + targets.size() + " · fallidos " + bad));
+                }
+            } catch (Exception e) { failed += targets.size() - saved; }
+            int good=saved, bad=failed;
+            mainHandler.post(() -> { setBusy(false,"Exportación: " + good + " archivos guardados, " + bad + " fallidos.");
+                message("Exportados " + good + " archivos."); });
+        },"weup-bulk-export").start();
     }
 
     private void scanMedia(ScanMode mode) {
@@ -488,8 +647,7 @@ public class MainActivity extends Activity {
             c = getContentResolver().query(children, cols, null, null, null);
             if (c == null) return;
             int idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
-            int nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
-            int mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
+            int nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME);            int mimeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE);
             int sizeCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE);
             int modCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
             List<String[]> dirs = new ArrayList<>();
@@ -542,48 +700,116 @@ public class MainActivity extends Activity {
     private void render() {
         if (resultList == null || resultCount == null || searchInput == null || typeFilter == null) return;
         resultList.removeAllViews();
-        String query = searchInput.getText().toString().toLowerCase(Locale.ROOT).trim();
-        int filter = typeFilter.getSelectedItemPosition();
-        int shown = 0;
-        for (FoundItem item : found) {
-            if (!item.name.toLowerCase(Locale.ROOT).contains(query) || !matchingType(item, filter)) continue;
-            LinearLayout card = vertical();
-            card.setBackground(background(CARD, BORDER, 12));
-            card.setPadding(dp(13), dp(12), dp(13), dp(12));
-            String category = item.carvedFile != null ? "RECONSTRUIDO POR FIRMA · VERIFICAR" : item.trashed ? "EN PAPELERA" : item.hidden ? "NOMBRE OCULTO" : "ARCHIVO EXISTENTE";
-            TextView chip = text(category, 10, item.trashed ? ACCENT : MUTED, true);
-            card.addView(chip);
-            addSpace(card, 4);
-            TextView title = text(item.name, 15, FG, true);
-            title.setMaxLines(2);
-            card.addView(title);
-            addSpace(card, 5);
-            card.addView(text(item.source + "  ·  " + sizeText(item.size), 12, MUTED, false));
-            card.addView(text(item.carvedFile != null ? "Sector aproximado: byte " + item.offset + " · fecha desconocida" : "Modificado: " + dateText(item.modified), 12, MUTED, false));
-            addSpace(card, 8);
-            LinearLayout actions = new LinearLayout(this);
-            actions.setOrientation(LinearLayout.HORIZONTAL);
-            Button preview = button("Vista previa", CARD);
-            preview.setOnClickListener(v -> showPreview(item));
-            actions.addView(preview, new LinearLayout.LayoutParams(0, dp(44), 1));
-            View gap = new View(this);
-            actions.addView(gap, new LinearLayout.LayoutParams(dp(7), 1));
-            Button download = button("Guardar archivo ↓", ACCENT);
-            download.setOnClickListener(v -> chooseCopyTarget(item));
-            actions.addView(download, new LinearLayout.LayoutParams(0, dp(44), 1));
-            card.addView(actions);
-            card.setOnClickListener(v -> itemActions(item));
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
-            lp.bottomMargin = dp(8);
-            resultList.addView(card, lp);
+        String query=searchInput.getText().toString().toLowerCase(Locale.ROOT).trim();
+        int filter=typeFilter.getSelectedItemPosition();
+        int shown=0;
+        LinearLayout imageRow=null;
+        int column=0;
+        for (FoundItem item:found) {
+            if (!item.name.toLowerCase(Locale.ROOT).contains(query) || !matchingType(item,filter)) continue;
+            if (item.mime.startsWith("image/")) {
+                if (imageRow==null || column==3) {
+                    imageRow=new LinearLayout(this);
+                    imageRow.setOrientation(LinearLayout.HORIZONTAL);
+                    LinearLayout.LayoutParams rowParams=new LinearLayout.LayoutParams(-1,-2);
+                    rowParams.bottomMargin=dp(8);
+                    resultList.addView(imageRow,rowParams);
+                    column=0;
+                }
+                LinearLayout tile=vertical();
+                tile.setPadding(dp(4),dp(5),dp(4),dp(7));
+                tile.setBackground(background(CARD,BORDER,10));
+                LinearLayout.LayoutParams tileLp = new LinearLayout.LayoutParams(0,-2,1f);
+                tileLp.setMargins(dp(2),0,dp(2),0);
+                imageRow.addView(tile,tileLp);
+                ImageView thumb=new ImageView(this);
+                thumb.setBackground(background(BORDER,0,8));
+                thumb.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                thumb.setImageResource(android.R.drawable.ic_menu_gallery);
+                int thumbSize=(getResources().getDisplayMetrics().widthPixels - dp(65))/3;
+                tile.addView(thumb,new LinearLayout.LayoutParams(-1,thumbSize));
+                requestThumbnail(item,thumb);
+                TextView name=text(item.name,11,FG,true);
+                name.setMaxLines(2);
+                name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                tile.addView(name);
+                tile.addView(text(sizeText(item.size),10,MUTED,false));
+                tile.addView(text(item.carvedFile!=null ? "POR FIRMA" : item.source.contains("Copia") ? "RASTRO ACCESIBLE" : "EXISTENTE",10,ACCENT,true));
+                CheckBox check=new CheckBox(this);
+                check.setText("Elegir"); check.setTextSize(11); check.setTextColor(FG);
+                String key=itemKey(item);
+                check.setChecked(selected.contains(key));
+                check.setOnCheckedChangeListener((b,checked) -> {
+                    if (checked) selected.add(key); else selected.remove(key);
+                    bulkButton.setText("Guardar seleccionadas (" + selected.size() + ")");
+                    bulkButton.setEnabled(!busy && !selected.isEmpty());
+                });
+                tile.addView(check);
+                Button save=button("Guardar ↓",ACCENT);
+                save.setTextSize(11);
+                save.setPadding(0,dp(3),0,dp(3));
+                save.setOnClickListener(v -> chooseCopyTarget(item));
+                tile.addView(save,new LinearLayout.LayoutParams(-1,dp(39)));
+                thumb.setOnClickListener(v -> showPreview(item));
+                column++;
+            } else {
+                imageRow=null; column=0;
+                LinearLayout card=vertical();
+                card.setPadding(dp(13),dp(12),dp(13),dp(12));
+                card.setBackground(background(CARD,BORDER,12));
+                card.addView(text(item.carvedFile!=null? "RECONSTRUIDO POR FIRMA · VERIFICAR" : item.trashed ? "EN PAPELERA" : "ARCHIVO EXISTENTE",10,ACCENT,true));
+                card.addView(text(item.name,15,FG,true));
+                card.addView(text(item.source + " · " + sizeText(item.size),12,MUTED,false));
+                LinearLayout actions = new LinearLayout(this);
+                Button preview=button("Vista previa",CARD);
+                preview.setOnClickListener(v -> showPreview(item));
+                actions.addView(preview,new LinearLayout.LayoutParams(0,dp(43),1f));
+                Button save=button("Guardar ↓",ACCENT);
+                save.setOnClickListener(v -> chooseCopyTarget(item));
+                actions.addView(save,new LinearLayout.LayoutParams(0,dp(43),1f));
+                card.addView(actions);
+                LinearLayout.LayoutParams cardLp=new LinearLayout.LayoutParams(-1,-2);
+                cardLp.bottomMargin=dp(8);
+                resultList.addView(card,cardLp);
+            }
             shown++;
         }
-        resultCount.setText("RESULTADOS · " + shown + " de " + found.size() + (lastMode == ScanMode.RAW ? "   ·   por desplazamiento" : "   ·   antiguos primero"));
-        if (shown == 0) {
-            TextView empty = text(found.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.", 13, MUTED, false);
-            empty.setPadding(dp(3), dp(12), dp(3), dp(12));
-            resultList.addView(empty);
-        }
+        resultCount.setText("RESULTADOS · " + shown + " de " + found.size() + (lastMode==ScanMode.INTERNAL ? " · rastros internos" : lastMode==ScanMode.RAW ? " · firmas" : ""));
+        if (shown==0) resultList.addView(text(found.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.",13,MUTED,false));
+    }
+
+    /** Thumbnail generated asynchronously with bounded bitmap dimensions and LRU memory. */
+    private void requestThumbnail(FoundItem item, ImageView view) {
+        String key=itemKey(item);
+        view.setTag(key);
+        Bitmap existing=thumbnails.get(key);
+        if (existing!=null && !existing.isRecycled()) { view.setImageBitmap(existing); return; }
+        WeakReference<ImageView> weak=new WeakReference<>(view);
+        previews.execute(() -> {
+            Bitmap bmp=null;
+            try {
+                BitmapFactory.Options o=new BitmapFactory.Options();
+                o.inJustDecodeBounds=true;
+                try (InputStream in=openFound(item)) { BitmapFactory.decodeStream(in,null,o); }
+                if (o.outWidth>0 && o.outHeight>0) {
+                    BitmapFactory.Options small=new BitmapFactory.Options();
+                    int max=Math.max(o.outWidth,o.outHeight);
+                    int sample=1;
+                    while (max/sample>280) sample*=2;
+                    small.inSampleSize=sample;
+                    small.inPreferredConfig=Bitmap.Config.RGB_565;
+                    try (InputStream in=openFound(item)) { bmp=BitmapFactory.decodeStream(in,null,small); }
+                }
+            } catch (Exception ignored) { }
+            Bitmap result=bmp;
+            mainHandler.post(() -> {
+                ImageView target=weak.get();
+                if (result!=null) {
+                    thumbnails.put(key,result);
+                    if (target!=null && key.equals(target.getTag())) target.setImageBitmap(result);
+                } else if (target!=null && key.equals(target.getTag())) target.setImageResource(android.R.drawable.ic_delete);
+            });
+        });
     }
 
     private void itemActions(FoundItem item) {
@@ -655,8 +881,8 @@ public class MainActivity extends Activity {
     /** User chooses an existing forensic image, e.g. an image of a removed microSD created on a PC. */
     private void selectRawImage() {
         if (busy) return;
-        new AlertDialog.Builder(this).setTitle("Búsqueda profunda real")
-                .setMessage("Selecciona una IMAGEN BINARIA sin cifrar (.img, .dd, .bin) de una tarjeta SD. "
+        new AlertDialog.Builder(this).setTitle("Carving de una imagen forense")
+                .setMessage("Selecciona una IMAGEN BINARIA sin cifrar (.img, .dd, .bin) de un medio previamente adquirido en modo forense. "
                         + "Se buscan firmas de JPG, PNG, PDF y ZIP/Office incluso si la tabla de archivos ya no los enumera. "
                         + "No se lee el espacio libre de la memoria interna de Android: elegir una carpeta no equivale a una imagen de disco. "
                         + "Los fragmentos sobrescritos o discontinuos no pueden reconstruirse con este método. "
@@ -753,6 +979,7 @@ public class MainActivity extends Activity {
     private InputStream openFound(FoundItem item) throws java.io.IOException {
         if (item.carvedFile != null) return new FileInputStream(item.carvedFile);
         if (item.uri == null) throw new java.io.FileNotFoundException("El archivo no tiene origen disponible");
+        if ("file".equals(item.uri.getScheme())) return new FileInputStream(new File(item.uri.getPath()));
         InputStream source = getContentResolver().openInputStream(item.uri);
         if (source == null) throw new java.io.FileNotFoundException("Android no permitió leer el archivo");
         return source;
@@ -930,10 +1157,10 @@ public class MainActivity extends Activity {
     private void showGuide() {
         new AlertDialog.Builder(this)
                 .setTitle("Cómo aumentar las posibilidades")
-                .setMessage("1. Evita instalar más apps o grabar archivos nuevos en el dispositivo de origen.\n\n"
+                .setMessage("1. La propia instalación de cualquier APK escribe en el almacenamiento: si los datos son críticos, evalúa antes una adquisición profesional.\n\n"
                     + "2. Revisa la papelera de Google Fotos, Google Drive, Galería y los gestores de archivos por separado.\n\n"
                     + "3. Busca copias en tus backups, WhatsApp y cuentas de nube.\n\n"
-                    + "4. Si estaba en una microSD extraíble, deja de usarla. Crea una copia binaria en un ordenador sin escribir en esa tarjeta; luego usa Análisis profundo para explorar dicha copia.\n\n"
+                    + "4. Si ya existe una imagen binaria sin cifrar adquirida por un profesional, usa el analizador de firmas. No desbloquees el bootloader del Redmi: puede borrar los datos.\n\n"
                     + "5. En la memoria interna cifrada, los archivos eliminados definitivamente hace mucho tiempo pueden ser irrecuperables incluso con root.\n\n"
                     + "El análisis por firmas sirve para archivos completos y contiguos; los fragmentados, cifrados o sobrescritos pueden no recuperarse. Guarda los resultados fuera del medio original.")
                 .setPositiveButton("Entendido", null)
