@@ -9,6 +9,11 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Color;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.pdf.PdfRenderer;
+import android.os.ParcelFileDescriptor;
+import android.widget.ImageView;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -33,6 +38,16 @@ import android.widget.Toast;
 import android.widget.AdapterView;
 
 import java.io.InputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipEntry;
+import java.util.Enumeration;
 import java.io.OutputStream;
 import java.text.DateFormat;
 import java.util.ArrayList;
@@ -46,15 +61,16 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Weup Rescue v0.1 — Weupperu.com
- * Finds media still present, accessible files and media items retained in Android's trash.
- * It does NOT perform raw-sector deleted-file recovery.
+ * Weup Rescue v0.2 — Weupperu.com
+ * Local, read-only retrieval from accessible storage and signature-carving of an explicitly
+ * selected, unencrypted forensic SD-card image. Does not bypass Android filesystem encryption.
  */
 public class MainActivity extends Activity {
     private static final int REQ_PERMISSIONS = 501;
     private static final int REQ_TREE = 502;
     private static final int REQ_SAVE = 503;
     private static final int REQ_RESTORE = 504;
+    private static final int REQ_IMAGE = 505;
     private static final int MAX_RESULTS = 700;
     private static final int MAX_DEPTH = 9;
 
@@ -72,21 +88,25 @@ public class MainActivity extends Activity {
     private TextView status, resultCount;
     private EditText searchInput;
     private Spinner typeFilter;
-    private Button trashButton, mediaButton, folderButton;
+    private Button trashButton, mediaButton, folderButton, rawButton, stopButton;
     private boolean busy = false;
     private boolean permissionPromptInProgress = false;
     private boolean permissionRequestedOnce = false;
     private ScanMode permissionMode = ScanMode.CURRENT;
     private FoundItem pendingCopy;
     private ScanMode lastMode = ScanMode.CURRENT;
+    private final AtomicBoolean cancelRaw = new AtomicBoolean(false);
+    private boolean rawRunning = false;
 
-    private enum ScanMode { TRASH, CURRENT, FOLDER }
+    private enum ScanMode { TRASH, CURRENT, FOLDER, RAW }
 
     private static class FoundItem {
         Uri uri;
         String name, mime, source, location;
         long size, modified;
         boolean trashed, hidden;
+        File carvedFile;
+        long offset = -1;
         FoundItem(Uri uri, String name, String mime, String source, String location,
                   long size, long modified, boolean trashed, boolean hidden) {
             this.uri = uri;
@@ -163,7 +183,7 @@ public class MainActivity extends Activity {
         title.setLineSpacing(dp(1), 1.03f);
         root.addView(title);
         addSpace(root, 10);
-        root.addView(text("Busca elementos de la papelera de Android, archivos existentes y copias antiguas u ocultas dentro de carpetas autorizadas.", 14, MUTED, false));
+        root.addView(text("Busca en papelera y carpetas, o analiza una imagen sin cifrar de una tarjeta SD para detectar firmas de archivos borrados no sobrescritos.", 14, MUTED, false));
         addSpace(root, 18);
 
         LinearLayout warning = vertical();
@@ -171,7 +191,7 @@ public class MainActivity extends Activity {
         warning.setPadding(dp(14), dp(13), dp(14), dp(13));
         warning.addView(text("IMPORTANTE", 11, ACCENT, true));
         addSpace(warning, 5);
-        warning.addView(text("No analiza sectores borrados ni recupera datos sobrescritos. Una fecha antigua indica última modificación, NO fecha de eliminación.", 13, FG, false));
+        warning.addView(text("La búsqueda profunda funciona con imágenes binarias (.img/.dd/.bin) de una microSD sin cifrar. Android NO permite leer el espacio libre de la memoria interna con una APK normal. Un hallazgo puede estar incompleto.", 13, FG, false));
         root.addView(warning);
         addSpace(root, 18);
 
@@ -186,6 +206,15 @@ public class MainActivity extends Activity {
         folderButton = button("▣  Elegir carpeta y buscar copias", CARD);
         folderButton.setOnClickListener(v -> chooseFolder());
         root.addView(folderButton, new LinearLayout.LayoutParams(-1, dp(52)));
+        addSpace(root, 8);
+        rawButton = button("⌕  Análisis profundo (imagen de microSD)", ACCENT);
+        rawButton.setOnClickListener(v -> selectRawImage());
+        root.addView(rawButton, new LinearLayout.LayoutParams(-1, dp(54)));
+        addSpace(root, 8);
+        stopButton = button("■  Detener búsqueda profunda", CARD);
+        stopButton.setVisibility(View.GONE);
+        stopButton.setOnClickListener(v -> { cancelRaw.set(true); status.setText("Deteniendo análisis, cerrando archivo en curso…"); });
+        root.addView(stopButton, new LinearLayout.LayoutParams(-1, dp(50)));
         addSpace(root, 8);
         Button infoButton = button("ⓘ  Consejos para archivos muy antiguos", CARD);
         infoButton.setOnClickListener(v -> showGuide());
@@ -303,6 +332,8 @@ public class MainActivity extends Activity {
             try { getContentResolver().takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION); }
             catch (Exception ignored) { /* Some providers only give temporary access. */ }
             scanFolder(tree);
+        } else if (requestCode == REQ_IMAGE && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            scanRaw(data.getData());
         } else if (requestCode == REQ_SAVE && resultCode == RESULT_OK && data != null && data.getData() != null) {
             if (pendingCopy != null) copyTo(pendingCopy, data.getData());
             pendingCopy = null;
@@ -323,6 +354,8 @@ public class MainActivity extends Activity {
         trashButton.setEnabled(!value);
         mediaButton.setEnabled(!value);
         folderButton.setEnabled(!value);
+        rawButton.setEnabled(!value);
+        stopButton.setVisibility(value && rawRunning ? View.VISIBLE : View.GONE);
         status.setText(label);
     }
 
@@ -333,7 +366,8 @@ public class MainActivity extends Activity {
 
     private synchronized boolean add(FoundItem item) {
         if (found.size() >= MAX_RESULTS) return false;
-        if (!knownUris.add(item.uri.toString())) return true;
+        String key = item.carvedFile != null ? "carve:" + item.offset : item.uri.toString();
+        if (!knownUris.add(key)) return true;
         found.add(item);
         return found.size() < MAX_RESULTS;
     }
@@ -516,7 +550,7 @@ public class MainActivity extends Activity {
             LinearLayout card = vertical();
             card.setBackground(background(CARD, BORDER, 12));
             card.setPadding(dp(13), dp(12), dp(13), dp(12));
-            String category = item.trashed ? "EN PAPELERA" : item.hidden ? "NOMBRE OCULTO" : "ARCHIVO EXISTENTE";
+            String category = item.carvedFile != null ? "RECONSTRUIDO POR FIRMA · VERIFICAR" : item.trashed ? "EN PAPELERA" : item.hidden ? "NOMBRE OCULTO" : "ARCHIVO EXISTENTE";
             TextView chip = text(category, 10, item.trashed ? ACCENT : MUTED, true);
             card.addView(chip);
             addSpace(card, 4);
@@ -525,14 +559,26 @@ public class MainActivity extends Activity {
             card.addView(title);
             addSpace(card, 5);
             card.addView(text(item.source + "  ·  " + sizeText(item.size), 12, MUTED, false));
-            card.addView(text("Modificado: " + dateText(item.modified), 12, MUTED, false));
+            card.addView(text(item.carvedFile != null ? "Sector aproximado: byte " + item.offset + " · fecha desconocida" : "Modificado: " + dateText(item.modified), 12, MUTED, false));
+            addSpace(card, 8);
+            LinearLayout actions = new LinearLayout(this);
+            actions.setOrientation(LinearLayout.HORIZONTAL);
+            Button preview = button("Vista previa", CARD);
+            preview.setOnClickListener(v -> showPreview(item));
+            actions.addView(preview, new LinearLayout.LayoutParams(0, dp(44), 1));
+            View gap = new View(this);
+            actions.addView(gap, new LinearLayout.LayoutParams(dp(7), 1));
+            Button download = button("Guardar archivo ↓", ACCENT);
+            download.setOnClickListener(v -> chooseCopyTarget(item));
+            actions.addView(download, new LinearLayout.LayoutParams(0, dp(44), 1));
+            card.addView(actions);
             card.setOnClickListener(v -> itemActions(item));
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
             lp.bottomMargin = dp(8);
             resultList.addView(card, lp);
             shown++;
         }
-        resultCount.setText("RESULTADOS · " + shown + " de " + found.size() + "   ·   antiguos primero");
+        resultCount.setText("RESULTADOS · " + shown + " de " + found.size() + (lastMode == ScanMode.RAW ? "   ·   por desplazamiento" : "   ·   antiguos primero"));
         if (shown == 0) {
             TextView empty = text(found.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.", 13, MUTED, false);
             empty.setPadding(dp(3), dp(12), dp(3), dp(12));
@@ -541,13 +587,17 @@ public class MainActivity extends Activity {
     }
 
     private void itemActions(FoundItem item) {
+        if (item.carvedFile != null) {
+            showPreview(item);
+            return;
+        }
         String detail = "Origen: " + item.source
                 + "\nUbicación: " + item.location
                 + "\nTamaño: " + sizeText(item.size)
                 + "\nModificación: " + dateText(item.modified)
                 + "\n\nLa modificación no es la fecha del borrado.";
         AlertDialog.Builder dialog = new AlertDialog.Builder(this)
-                .setTitle(item.name).setMessage(detail).setNegativeButton("Cerrar", null);
+                .setTitle(item.name).setMessage(detail).setNegativeButton("Vista previa", (d,which) -> showPreview(item));
         if (item.trashed && Build.VERSION.SDK_INT >= 30) {
             dialog.setNeutralButton("Guardar copia", (d, which) -> chooseCopyTarget(item));
             dialog.setPositiveButton("Restaurar", (d, which) -> restore(item));
@@ -573,7 +623,7 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             boolean success = false;
             String error = "Archivo no accesible para copiar. Prueba a restaurarlo primero si está en la papelera.";
-            try (InputStream in = getContentResolver().openInputStream(item.uri);
+            try (InputStream in = openFound(item);
                  OutputStream out = getContentResolver().openOutputStream(destination, "w")) {
                 if (in == null || out == null) throw new IllegalStateException("El proveedor no permitió abrir el archivo.");
                 byte[] buffer = new byte[64 * 1024];
@@ -602,6 +652,266 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** User chooses an existing forensic image, e.g. an image of a removed microSD created on a PC. */
+    private void selectRawImage() {
+        if (busy) return;
+        new AlertDialog.Builder(this).setTitle("Búsqueda profunda real")
+                .setMessage("Selecciona una IMAGEN BINARIA sin cifrar (.img, .dd, .bin) de una tarjeta SD. "
+                        + "Se buscan firmas de JPG, PNG, PDF y ZIP/Office incluso si la tabla de archivos ya no los enumera. "
+                        + "No se lee el espacio libre de la memoria interna de Android: elegir una carpeta no equivale a una imagen de disco. "
+                        + "Los fragmentos sobrescritos o discontinuos no pueden reconstruirse con este método. "
+                        + "Se utiliza hasta 512 MB de caché temporal interna, sin modificar el archivo de origen.")
+                .setNegativeButton("Cancelar", null)
+                .setPositiveButton("Seleccionar imagen", (d, w) -> {
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType("*/*");
+                    i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    try { startActivityForResult(i, REQ_IMAGE); }
+                    catch (Exception e) { message("El selector de archivos no está disponible."); }
+                }).show();
+    }
+
+    private File cacheDirectory() {
+        return new File(getCacheDir(), "weup_carved");
+    }
+
+    private void clearCarveCache() {
+        File dir = cacheDirectory();
+        File[] files = dir.listFiles();
+        if (files != null) for (File f : files) if (f.isFile()) f.delete();
+    }
+
+    private void scanRaw(Uri imageUri) {
+        if (busy) return;
+        lastMode = ScanMode.RAW;
+        cancelRaw.set(false);
+        rawRunning = true;
+        reset();
+        clearCarveCache();
+        setBusy(true, "Analizando imagen en solo lectura… No cierres la aplicación.");
+        new Thread(() -> {
+            SignatureCarver.Report report = null;
+            String error = null;
+            try (InputStream source = getContentResolver().openInputStream(imageUri)) {
+                if (source == null) throw new java.io.IOException("No se pudo leer la imagen seleccionada");
+                report = SignatureCarver.scan(source, cacheDirectory(), cancelRaw, new SignatureCarver.Listener() {
+                    @Override public void onProgress(long bytes, int candidateCount) {
+                        mainHandler.post(() -> {
+                            if (rawRunning) status.setText("Analizados " + sizeText(bytes) + " · " + found.size()
+                                    + " candidatos guardados · Pulsa Detener para finalizar.");
+                        });
+                    }
+                    @Override public void onFound(SignatureCarver.Result result) {
+                        // JPEG/PNG decoders reject false positives and severely corrupted candidates.
+                        if (result.mime.startsWith("image/")) {
+                            BitmapFactory.Options options = new BitmapFactory.Options();
+                            options.inJustDecodeBounds = true;
+                            BitmapFactory.decodeFile(result.file.getAbsolutePath(), options);
+                            if (options.outWidth < 1 || options.outHeight < 1) {
+                                result.file.delete();
+                                return;
+                            }
+                        }
+                        String ext = result.extension;
+                        String mime = result.mime;
+                        if ("zip".equals(ext)) {
+                            try (ZipFile archive = new ZipFile(result.file)) {
+                                if (archive.getEntry("word/document.xml") != null) { ext="docx"; mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"; }
+                                else if (archive.getEntry("xl/workbook.xml") != null) { ext="xlsx"; mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; }
+                                else if (archive.getEntry("ppt/presentation.xml") != null) { ext="pptx"; mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"; }
+                            } catch (Exception ignored) { }
+                        }
+                        String label = String.format(Locale.ROOT, "recuperado_%012d.%s", result.offset, ext);
+                        FoundItem item = new FoundItem(null, label, mime, "Análisis de imagen binaria",
+                                "Desplazamiento byte " + result.offset, result.length, 0, false, false);
+                        item.carvedFile = result.file;
+                        item.offset = result.offset;
+                        add(item);
+                    }
+                });
+            } catch (Exception e) { error = safe(e.getMessage(), e.getClass().getSimpleName()); }
+            SignatureCarver.Report done = report;
+            String failed = error;
+            mainHandler.post(() -> {
+                rawRunning = false;
+                render();
+                String summary = found.size() + " candidatos reconstruidos por firmas (no se garantiza integridad). ";
+                if (done != null) {
+                    summary += "Leídos " + sizeText(done.scannedBytes) + ". ";
+                    if (done.stopped) summary += "Exploración detenida por el usuario. ";
+                    if (done.cacheLimit) summary += "Se alcanzó el límite de caché de 512 MB. ";
+                }
+                if (failed != null) summary += "No se completó el escaneo: " + failed + ". ";
+                if (found.isEmpty()) summary += "No se hallaron archivos completos reconocibles. ";
+                summary += "Usa Vista previa para revisar y Guardar archivo para exportar a Descargas, SD u otro destino.";
+                setBusy(false, summary);
+            });
+        }, "weup-signature-carving").start();
+    }
+
+    private InputStream openFound(FoundItem item) throws java.io.IOException {
+        if (item.carvedFile != null) return new FileInputStream(item.carvedFile);
+        if (item.uri == null) throw new java.io.FileNotFoundException("El archivo no tiene origen disponible");
+        InputStream source = getContentResolver().openInputStream(item.uri);
+        if (source == null) throw new java.io.FileNotFoundException("Android no permitió leer el archivo");
+        return source;
+    }
+
+    private static final class Preview {
+        Bitmap bitmap;
+        String details;
+    }
+
+    private Bitmap decodeImage(FoundItem item) throws Exception {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream in = openFound(item)) { BitmapFactory.decodeStream(in, null, bounds); }
+        if (bounds.outWidth < 1 || bounds.outHeight < 1) throw new java.io.IOException("No se pudo decodificar la imagen; podría estar corrupta.");
+        BitmapFactory.Options opt = new BitmapFactory.Options();
+        int sample = 1;
+        while (Math.max(bounds.outWidth / sample, bounds.outHeight / sample) > 1400) sample *= 2;
+        opt.inSampleSize = sample;
+        try (InputStream in = openFound(item)) {
+            Bitmap picture = BitmapFactory.decodeStream(in, null, opt);
+            if (picture == null) throw new java.io.IOException("El contenido está incompleto o no se puede decodificar.");
+            return picture;
+        }
+    }
+
+    private Bitmap decodePdf(FoundItem item) throws Exception {
+        ParcelFileDescriptor fd = null;
+        File temporary = null;
+        try {
+            if (item.carvedFile != null) {
+                fd = ParcelFileDescriptor.open(item.carvedFile, ParcelFileDescriptor.MODE_READ_ONLY);
+            } else {
+                // Some SAF providers return non-seekable descriptors. A local temporary file ensures PdfRenderer can seek.
+                temporary = File.createTempFile("pdf_preview_", ".pdf", getCacheDir());
+                long written = 0;
+                try (InputStream in = openFound(item);
+                     OutputStream out = new BufferedOutputStream(new FileOutputStream(temporary))) {
+                    byte[] buf = new byte[65536]; int n;
+                    while ((n = in.read(buf)) >= 0) {
+                        written += n;
+                        if (written > 128L*1024*1024) throw new java.io.IOException("PDF demasiado grande para vista previa (128 MB)");
+                        out.write(buf, 0, n);
+                    }
+                }
+                fd = ParcelFileDescriptor.open(temporary, ParcelFileDescriptor.MODE_READ_ONLY);
+            }
+            try (PdfRenderer pdf = new PdfRenderer(fd)) {
+                if (pdf.getPageCount() < 1) throw new java.io.IOException("El PDF no tiene páginas legibles");
+                try (PdfRenderer.Page page = pdf.openPage(0)) {
+                    float scale = 1000f / Math.max(page.getWidth(), 1);
+                    int w = Math.max(1, Math.round(page.getWidth() * scale));
+                    int h = Math.max(1, Math.round(page.getHeight() * scale));
+                    h = Math.min(h, 2400);
+                    Bitmap b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                    b.eraseColor(Color.WHITE);
+                    page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                    return b;
+                }
+            }
+        } finally {
+            // PdfRenderer closes its descriptor; a second close is harmless.
+            if (fd != null) try { fd.close(); } catch (Exception ignored) { }
+            if (temporary != null) temporary.delete();
+        }
+    }
+
+    private String previewArchive(FoundItem item) throws Exception {
+        if (item.carvedFile == null) return "El archivo existe. Para revisar su contenido, guárdalo y ábrelo con un lector compatible.";
+        StringBuilder sb = new StringBuilder("Contenido del contenedor ZIP/Office:\n\n");
+        try (ZipFile zip = new ZipFile(item.carvedFile)) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            int count = 0;
+            while (entries.hasMoreElements() && count < 35) {
+                ZipEntry entry = entries.nextElement();
+                sb.append(entry.getName()).append("\n"); count++;
+            }
+            if (entries.hasMoreElements()) sb.append("… y más entradas");
+        }
+        return sb.toString();
+    }
+
+    private Preview makePreview(FoundItem item) throws Exception {
+        Preview preview = new Preview();
+        String mime = item.mime.toLowerCase(Locale.ROOT);
+        if (mime.startsWith("image/") || ends(item.name.toLowerCase(Locale.ROOT), ".jpg", ".jpeg", ".png")) {
+            preview.bitmap = decodeImage(item);
+        } else if (mime.equals("application/pdf") || item.name.toLowerCase(Locale.ROOT).endsWith(".pdf")) {
+            preview.bitmap = decodePdf(item);
+            preview.details = "Primera página del PDF.";
+        } else if (ends(item.name.toLowerCase(Locale.ROOT), ".zip", ".docx", ".xlsx", ".pptx")) {
+            preview.details = previewArchive(item);
+        } else if (mime.startsWith("text/") || ends(item.name.toLowerCase(Locale.ROOT), ".csv", ".json", ".xml")) {
+            try (InputStream in = openFound(item); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] b = new byte[4096]; int n = in.read(b);
+                if (n > 0) out.write(b, 0, n);
+                preview.details = new String(out.toByteArray(), StandardCharsets.UTF_8);
+            }
+        } else preview.details = "Este formato no tiene previsualizador integrado. Puedes guardarlo para abrirlo en otra aplicación.";
+        return preview;
+    }
+
+    private void showPreview(FoundItem item) {
+        if (item.mime.startsWith("video/") || item.mime.startsWith("audio/")) {
+            if (item.uri != null) {
+                try {
+                    Intent view = new Intent(Intent.ACTION_VIEW);
+                    view.setDataAndType(item.uri, item.mime);
+                    view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    startActivity(view);
+                    return;
+                } catch (Exception ignored) { /* Show explanatory preview below. */ }
+            }
+        }
+        ScrollView scroller = new ScrollView(this);
+        LinearLayout layout = vertical();
+        layout.setPadding(dp(16),dp(12),dp(16),dp(12));
+        scroller.addView(layout);
+        TextView subtitle = text(item.source + " · " + sizeText(item.size)
+                + (item.carvedFile != null ? "\nReconstrucción por firma: comprueba el archivo antes de utilizarlo." : ""), 12, MUTED, false);
+        layout.addView(subtitle);
+        addSpace(layout, 12);
+        TextView loading = text("Preparando vista previa…", 14, FG, false);
+        layout.addView(loading);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(item.name)
+                .setView(scroller)
+                .setNegativeButton("Cerrar", null)
+                .setPositiveButton("Guardar / descargar", (d,which) -> chooseCopyTarget(item))
+                .create();
+        dialog.show();
+        new Thread(() -> {
+            Preview result = null; String problem = null;
+            try { result = makePreview(item); }
+            catch (Exception e) { problem = safe(e.getMessage(), "Este archivo no se puede previsualizar."); }
+            Preview data = result; String failure = problem;
+            mainHandler.post(() -> {
+                if (!dialog.isShowing()) {
+                    if (data != null && data.bitmap != null) data.bitmap.recycle();
+                    return;
+                }
+                layout.removeView(loading);
+                if (failure != null) {
+                    layout.addView(text("Vista previa no disponible: " + failure
+                            + "\nSi es un archivo reconstruido, puede estar incompleto.", 14, FG, false));
+                } else if (data != null) {
+                    if (data.bitmap != null) {
+                        ImageView display = new ImageView(this);
+                        display.setImageBitmap(data.bitmap);
+                        display.setAdjustViewBounds(true);
+                        display.setScaleType(ImageView.ScaleType.FIT_CENTER);
+                        layout.addView(display, new LinearLayout.LayoutParams(-1, -2));
+                    }
+                    if (data.details != null) layout.addView(text(data.details, 13, FG, false));
+                }
+            });
+        }, "weup-preview").start();
+    }
+
     private String dateText(long date) {
         return date > 0 ? DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, new Locale("es", "PE")).format(new Date(date)) : "Desconocida";
     }
@@ -623,9 +933,9 @@ public class MainActivity extends Activity {
                 .setMessage("1. Evita instalar más apps o grabar archivos nuevos en el dispositivo de origen.\n\n"
                     + "2. Revisa la papelera de Google Fotos, Google Drive, Galería y los gestores de archivos por separado.\n\n"
                     + "3. Busca copias en tus backups, WhatsApp y cuentas de nube.\n\n"
-                    + "4. Si el archivo estaba en una microSD extraíble, deja de usarla y analízala desde una computadora con un lector de tarjetas.\n\n"
+                    + "4. Si estaba en una microSD extraíble, deja de usarla. Crea una copia binaria en un ordenador sin escribir en esa tarjeta; luego usa Análisis profundo para explorar dicha copia.\n\n"
                     + "5. En la memoria interna cifrada, los archivos eliminados definitivamente hace mucho tiempo pueden ser irrecuperables incluso con root.\n\n"
-                    + "La aplicación no promete reconstruir información que ya no existe.")
+                    + "El análisis por firmas sirve para archivos completos y contiguos; los fragmentados, cifrados o sobrescritos pueden no recuperarse. Guarda los resultados fuera del medio original.")
                 .setPositiveButton("Entendido", null)
                 .show();
     }

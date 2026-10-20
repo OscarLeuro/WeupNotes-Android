@@ -1,38 +1,34 @@
-# Weup Rescue — buscador y rescatador responsable de archivos (Android)
+# Weup Rescue v0.2 · Weupperu.com
 
-Autor: Weupperu.com · Versión 0.1.0 · Android 8.0+ (API 26)
+Proyecto Android Java, Android 8.0+ (API 26), sin INTERNET, sin analítica, sin dependencias de terceros en tiempo de ejecución.
 
-## Qué hace realmente
+## Recuperación y límites importantes
 
-- Consulta los archivos que Android mantiene en la papelera multimedia (Android 11+, si Android concede acceso) y solicita autorización del sistema antes de restaurarlos.
-- Examina fotos, vídeos y audio **que todavía existen** y a los que se tiene permiso de acceso.
-- Recorre una carpeta elegida por el usuario mediante el selector de documentos de Android; localiza archivos antiguos, subcarpetas y nombres ocultos (que empiezan con un punto) que sean accesibles.
-- Filtra por nombre y tipo, muestra fecha de última modificación (NO fecha de eliminación) y permite guardar una copia en un destino elegido por el usuario.
-- Sin conexión a Internet, sin rastreadores, sin carga de datos a terceros, sin acceso root ni permiso de acceso completo al almacenamiento.
+**No existe una APK ordinaria capaz de hacer el equivalente a Recuva sobre los sectores borrados de la memoria interna cifrada de Android.** MediaStore/SAF dan acceso a archivos existentes y algunas papeleras, no al espacio libre. TRIM, sobrescritura y la pérdida de claves de cifrado pueden hacer una recuperación imposible incluso con root. No prometemos recuperar archivos eliminados definitivamente.
 
-## Lo que NO hace
+**Análisis profundo real de imagen de microSD:** usa `ACTION_OPEN_DOCUMENT` para seleccionar una imagen binaria (.img/.dd/.bin), creada previamente y de forma segura desde una tarjeta microSD EXTRAÍBLE sin cifrar. `SignatureCarver` lee secuencialmente los bytes de esa imagen sin escribir en la fuente y busca firmas de:
 
-No es un análisis forense del espacio libre ni puede acceder a bloques borrados del chip de almacenamiento interno. No puede recuperar archivos sobrescritos, invalidados por TRIM, cuyas claves de cifrado se han perdido ni elementos a los que Android no permite acceso. Tampoco enumera todas las papeleras privadas de aplicaciones (Google Fotos, WhatsApp, gestores de archivos, etc.). Por tanto, no asegura recuperar archivos eliminados definitivamente hace meses o años. En Android 11+ el selector impide escoger determinadas raíces, Downloads y Android/data; son restricciones del SO, no fallos del proyecto.
+- JPEG: SOI a EOI, validación de dimensiones con BitmapFactory.
+- PNG: cabecera a IEND, validación de dimensiones con BitmapFactory.
+- PDF: `%PDF-` hasta `%%EOF`, vista previa de la primera página si el renderer puede decodificarlo.
+- ZIP: firma local a fin de directorio central, validación con ZipFile; detecta DOCX, XLSX, PPTX por sus entradas internas.
 
-## Cómo generar el APK
+Solo detecta candidatos completos **contiguos**; las firmas no prueban por sí solas que los archivos sean correctos. Los tamaños máximos de cada candidato son 64 MB para JPEG/PNG y 128 MB para PDF/ZIP; máximo 100 candidatos y 512 MB de caché interna por exploración. Para evitar pérdida o sobrescritura accidental, **se recomienda generar la imagen de una microSD en otro dispositivo** y guardar las exportaciones en otro destino. No puede analizar directamente la memoria interna ni leer el espacio libre de una carpeta seleccionada. No accede a dispositivos de bloque sin root, ni evade el cifrado.
 
-**Opción A — GitHub Actions:** crear un repositorio propio, subir el CONTENIDO de esta carpeta a su raíz, ir a Actions > Compilar APK de Weup Rescue > Run workflow. En el trabajo terminado, descargar el artefacto `WeupRescue-APK` y extraer `app-debug.apk`. El APK debug está firmado automáticamente para instalar y probar; no es una firma de distribución en Play Store.
+## Pantalla de resultados
 
-**Opción B — Android Studio:** File > Open > esta carpeta, usar JDK 17, dejar descargar Android SDK 35 y Gradle/Android Gradle Plugin; seleccionar Build > Build Bundle(s) / APK(s) > Build APK(s). Archivo resultante: `app/build/outputs/apk/debug/app-debug.apk`.
+- Cada coincidencia lleva su procedencia: `Archivo existente`, `En papelera` o `Reconstruido por firma · verificar`.
+- `Vista previa`: imágenes decodificadas, primera página PDF, lista de entradas ZIP/Office o muestra de texto; audio/vídeo existentes se abren con reproductor compatible de Android. La vista previa puede fallar para archivos cifrados o incompletos.
+- `Guardar archivo ↓`: selector nativo de Android (`ACTION_CREATE_DOCUMENT`) para elegir Descargas, microSD accesible u otra ubicación. El origen se abre en modo lectura, el destino recibe copia independiente; no hay ninguna descarga desde un servidor. Papelera: restauración sujeta a autorización de Android.
+- Indica desplazamiento de byte aproximado para imagen binaria, **no fecha inventada de eliminación**; búsqueda y filtrado por tipo/nombre; botón Detener durante el escaneo binario.
+- La caché de resultados reconstruidos es temporal; guarda enseguida lo que te interese. Al iniciar otro análisis binario se descartan resultados temporales del anterior.
 
-**Línea de comandos** (si ya está instalado Gradle 8.9, SDK 35 y JDK 17): `gradle :app:assembleDebug`.
+## Compilación
 
-## Uso
+JDK 17, Android SDK 35, Gradle 8.9. Abrir carpeta en Android Studio y ejecutar `gradle :app:assembleDebug`. También hay workflow de GitHub Actions para el proyecto ubicado en `rescue/` dentro de la rama independiente `weup-rescue-android` del repositorio. APK generado: `app/build/outputs/apk/debug/app-debug.apk` (firma de depuración del compilador; distintas máquinas pueden producir distintas claves debug y Android podría requerir desinstalar la anterior versión antes de instalar esta).
 
-1. Conceder solo los permisos de fotos/vídeos/audio que se deseen examinar.
-2. Buscar en «Papelera Android» (sujeto al acceso que concede el sistema), «Multimedia actual» o «Elegir carpeta».
-3. Tocar una coincidencia. Si está en la papelera, pulsar «Restaurar» y aprobar en el diálogo de Android. En otro caso, usar «Guardar una copia»; Android deja escoger dónde guardarla.
-4. Para archivos perdidos de hace mucho tiempo: dejar de usar el dispositivo de origen, revisar copias de Google Fotos/Drive y papeleras de apps. Para una microSD extraíble, examinarla desde una computadora sin escribir datos nuevos sobre ella.
+Prueba unitaria sin Android: `javac -d /tmp/weup-test app/src/main/java/com/weupperu/rescate/SignatureCarver.java tests/SignatureCarverSmoke.java && java -cp /tmp/weup-test SignatureCarverSmoke`.
 
 ## Privacidad
 
-La búsqueda y copia se realizan en el dispositivo. No se declara permiso INTERNET. El código no envía datos a un servidor. La elección de carpetas y destinos se hace con el sistema Android.
-
-## Notas técnicas
-
-Implementación Java nativa (sin librerías de terceros de interfaz), MediaStore y Storage Access Framework. Límite por exploración: 700 coincidencias y profundidad de 9 niveles; se puede ajustar en `MainActivity.java`. El listado muestra **fecha de modificación**, no fecha del borrado. Algunas capas de fabricantes restringen aún más la papelera o no admiten la consulta de elementos de otras aplicaciones: se informa al usuario si la lectura falla.
+Permisos mínimos de multimedia para consultar elementos existentes; exploración de carpetas/imágenes y exportación con el selector del sistema. El manifiesto no incluye permiso INTERNET. El programa no hace root, no escribe en imágenes fuente ni elimina archivos originales. Autor: Weupperu.com.
