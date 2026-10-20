@@ -67,12 +67,14 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
 /**
- * Weup Rescue v0.3 — Weupperu.com
+ * Weup Rescue v0.3.1 — Weupperu.com
  * Local, read-only retrieval from accessible storage and signature-carving of an explicitly
  * selected, unencrypted forensic SD-card image. Does not bypass Android filesystem encryption.
  */
@@ -86,6 +88,7 @@ public class MainActivity extends Activity {
     private static final int REQ_BULK = 507;
     private static final int REQ_REPORT = 508;
     private static final int MAX_RESULTS = 700;
+    private static final int PAGE_SIZE = 45;
     private static final int MAX_DEPTH = 9;
 
     private static final int BG = Color.rgb(16, 18, 27);
@@ -104,6 +107,11 @@ public class MainActivity extends Activity {
     private Spinner typeFilter;
     private Button trashButton, mediaButton, folderButton, rawButton, stopButton, internalButton, bulkButton;
     private final Set<String> selected = new HashSet<>();
+    // All UI collections below are accessed only on Android's main thread.
+    private final Map<String,List<WeakReference<ImageView>>> thumbnailWaiters = new HashMap<>();
+    private int scanEpoch = 0;
+    private int visibleResults = PAGE_SIZE;
+    private boolean renderPending = false;
     private final ExecutorService previews = Executors.newFixedThreadPool(2);
     private final LruCache<String,Bitmap> thumbnails = new LruCache<String,Bitmap>(12*1024*1024) {
         @Override protected int sizeOf(String k, Bitmap b) { return b.getByteCount(); }
@@ -363,8 +371,10 @@ public class MainActivity extends Activity {
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_ALL_FILES) {
-            if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) scanInternal();
-            else message("No se habilitó Todos los archivos. El escaneo de rastros internos requiere ese permiso.");
+            try {
+                if (Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()) scanInternal();
+                else message("No se habilitó Todos los archivos. El escaneo de rastros internos requiere ese permiso.");
+            } catch (Exception e) { message("No se pudo verificar el permiso: " + safe(e.getMessage(), "acceso restringido")); }
         } else if (requestCode == REQ_BULK && resultCode == RESULT_OK && data != null && data.getData() != null) {
             bulkCopy(data.getData());
         } else if (requestCode == REQ_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
@@ -402,7 +412,9 @@ public class MainActivity extends Activity {
     }
 
     private void reset() {
-        found.clear(); knownUris.clear(); selected.clear(); thumbnails.evictAll();
+        synchronized (this) { found.clear(); knownUris.clear(); }
+        selected.clear(); thumbnails.evictAll(); thumbnailWaiters.clear();
+        scanEpoch++; visibleResults = PAGE_SIZE; renderPending = false;
         if (bulkButton != null) { bulkButton.setText("Guardar seleccionadas (0)"); bulkButton.setEnabled(false); }
         render();
     }
@@ -441,51 +453,86 @@ public class MainActivity extends Activity {
         scanInternal();
     }
 
-    private void scanInternal() {
-        if (busy) return;
-        lastMode = ScanMode.INTERNAL;
-        cancelInternal.set(false);
-        internalRunning = true;
-        reset();
-        setBusy(true, "Escaneando firmas JPG/PNG/GIF/WEBP/HEIC y rastros accesibles…");
-        new Thread(() -> {
-            InternalTraceScanner.Report report = null;
-            String error = null;
-            try {
-                report = InternalTraceScanner.scan(Environment.getExternalStorageDirectory(), cancelInternal, MAX_RESULTS,
-                        new InternalTraceScanner.Listener() {
-                    @Override public void onFound(File f, String mime, boolean residual, String reason) {
-                        FoundItem item = new FoundItem(Uri.fromFile(f), f.getName(), mime, reason,
-                                f.getParent(), f.length(), f.lastModified(), false, f.getName().startsWith("."));
-                        add(item);
-                        // Publish progress while scanning, with updates throttled for large result sets.
-                        if (found.size() % 25 == 0) mainHandler.post(() -> { render(); status.setText(
-                            "Rastros accesibles: " + found.size() + " · Buscando más archivos…"); });
-                    }
-                    @Override public void onProgress(int inspected, int matches) {
-                        inspectedInternal = inspected;
-                        if (inspected % 1000 == 0) mainHandler.post(() -> status.setText(
-                            "Archivos revisados: " + inspected + " · imágenes accesibles: " + matches));
-                    }
-                });
-            } catch (Exception e) { error=safe(e.getMessage(),"error de lectura"); }
-            InternalTraceScanner.Report result=report;
-            String failure=error;
-            mainHandler.post(() -> {
-                internalRunning=false;
+    /** Only one delayed UI refresh is scheduled, regardless of scan speed. */
+    private void scheduleInternalRender() {
+        mainHandler.post(() -> {
+            if (!internalRunning || renderPending) return;
+            renderPending = true;
+            mainHandler.postDelayed(() -> {
+                renderPending = false;
+                if (!internalRunning || isFinishing() || isDestroyed()) return;
                 render();
-                String detail = "Encontradas " + found.size() + " imágenes/copias todavía accesibles";
-                if (result != null) {
-                    detail += " · " + result.inspected + " archivos revisados";
-                    if (result.restricted > 0) detail += " · " + result.restricted + " ubicaciones restringidas";
-                    if (result.capReached) detail += " · límite de seguridad alcanzado";
-                    if (result.stopped) detail += " · detenido";
-                }
-                if (failure != null) detail += " · Error: " + failure;
-                detail += ". No es un análisis de sectores borrados; la antigüedad real del borrado no es verificable.";
-                setBusy(false,detail);
-            });
-        },"weup-internal-traces").start();
+                status.setText("Rastros accesibles: " + countFound() + " · Buscando más archivos…");
+            }, 600);
+        });
+    }
+
+    private synchronized int countFound() { return found.size(); }
+
+    private void scanInternal() {
+        if (busy || internalRunning) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+                message("No se concedió el acceso al almacenamiento compartido. Habilita 'Administrar todos los archivos'.");
+                return;
+            }
+            File root = Environment.getExternalStorageDirectory();
+            if (root == null || !root.isDirectory() || !root.canRead()) {
+                message("Android no permite leer el almacenamiento compartido desde esta app.");
+                return;
+            }
+            lastMode = ScanMode.INTERNAL;
+            cancelInternal.set(false);
+            internalRunning = true;
+            reset();
+            setBusy(true, "Escaneando firmas JPG/PNG/GIF/WEBP/HEIC y rastros accesibles…");
+            new Thread(() -> {
+                InternalTraceScanner.Report report = null;
+                String error = null;
+                java.util.concurrent.atomic.AtomicInteger arrivals = new java.util.concurrent.atomic.AtomicInteger(0);
+                try {
+                    report = InternalTraceScanner.scan(root, cancelInternal, MAX_RESULTS,
+                            new InternalTraceScanner.Listener() {
+                        @Override public void onFound(File f, String mime, boolean residual, String reason) {
+                            FoundItem item = new FoundItem(Uri.fromFile(f), f.getName(), mime, reason,
+                                    f.getParent(), f.length(), f.lastModified(), false, f.getName().startsWith("."));
+                            if (add(item)) {
+                                int n = arrivals.incrementAndGet();
+                                if (n == 1 || n % 12 == 0) scheduleInternalRender();
+                            }
+                        }
+                        @Override public void onProgress(int inspected, int matches) {
+                            inspectedInternal = inspected;
+                            if (inspected > 0 && inspected % 2000 == 0) mainHandler.post(() -> {
+                                if (internalRunning && !isFinishing()) status.setText(
+                                        "Archivos revisados: " + inspected + " · imágenes accesibles: " + matches);
+                            });
+                        }
+                    });
+                } catch (Exception e) { error=safe(e.getMessage(), e.getClass().getSimpleName()); }
+                InternalTraceScanner.Report result=report;
+                String failure=error;
+                mainHandler.post(() -> {
+                    internalRunning=false;
+                    renderPending=false;
+                    if (isFinishing() || isDestroyed()) return;
+                    render();
+                    String detail = "Encontradas " + countFound() + " imágenes/copias todavía accesibles";
+                    if (result != null) {
+                        detail += " · " + result.inspected + " archivos revisados";
+                        if (result.restricted > 0) detail += " · " + result.restricted + " ubicaciones restringidas";
+                        if (result.capReached) detail += " · límite de seguridad alcanzado";
+                        if (result.stopped) detail += " · detenido";
+                    }
+                    if (failure != null) detail += " · Error: " + failure;
+                    detail += ". No es un análisis de sectores borrados; la antigüedad real del borrado no es verificable.";
+                    setBusy(false,detail);
+                });
+            },"weup-internal-traces").start();
+        } catch (Exception e) {
+            internalRunning = false;
+            setBusy(false, "No se pudo iniciar el escaneo: " + safe(e.getMessage(), e.getClass().getSimpleName()));
+        }
     }
 
     private void chooseBulkTarget() {
@@ -707,8 +754,13 @@ public class MainActivity extends Activity {
         int shown=0;
         LinearLayout imageRow=null;
         int column=0;
-        for (FoundItem item:found) {
+        List<FoundItem> snapshot;
+        synchronized (this) { snapshot = new ArrayList<>(found); }
+        int eligible = 0;
+        for (FoundItem item:snapshot) {
             if (!item.name.toLowerCase(Locale.ROOT).contains(query) || !matchingType(item,filter)) continue;
+            eligible++;
+            if (shown >= visibleResults) continue;
             if (item.mime.startsWith("image/")) {
                 if (imageRow==null || column==3) {
                     imageRow=new LinearLayout(this);
@@ -776,17 +828,28 @@ public class MainActivity extends Activity {
             }
             shown++;
         }
-        resultCount.setText("RESULTADOS · " + shown + " de " + found.size() + (lastMode==ScanMode.INTERNAL ? " · rastros internos" : lastMode==ScanMode.RAW ? " · firmas" : ""));
-        if (shown==0) resultList.addView(text(found.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.",13,MUTED,false));
+        resultCount.setText("RESULTADOS · " + shown + " visibles · " + eligible + " coincidencias · " + snapshot.size() + " totales" +
+                (lastMode==ScanMode.INTERNAL ? " · rastros internos" : lastMode==ScanMode.RAW ? " · firmas" : ""));
+        if (eligible > shown) {
+            Button more = button("Mostrar más fotografías (" + (eligible-shown) + " restantes)", CARD);
+            more.setOnClickListener(v -> { visibleResults += PAGE_SIZE; render(); });
+            resultList.addView(more,new LinearLayout.LayoutParams(-1,dp(50)));
+        }
+        if (shown==0) resultList.addView(text(snapshot.isEmpty() ? "Todavía no hay resultados." : "Ningún archivo coincide con el filtro.",13,MUTED,false));
     }
 
-    /** Thumbnail generated asynchronously with bounded bitmap dimensions and LRU memory. */
+    /** One decoding task per image; all visible copies of a thumbnail share the result. */
     private void requestThumbnail(FoundItem item, ImageView view) {
         String key=itemKey(item);
         view.setTag(key);
         Bitmap existing=thumbnails.get(key);
         if (existing!=null && !existing.isRecycled()) { view.setImageBitmap(existing); return; }
-        WeakReference<ImageView> weak=new WeakReference<>(view);
+        List<WeakReference<ImageView>> waiters = thumbnailWaiters.get(key);
+        if (waiters != null) { waiters.add(new WeakReference<>(view)); return; }
+        waiters=new ArrayList<>();
+        waiters.add(new WeakReference<>(view));
+        thumbnailWaiters.put(key,waiters);
+        final int epoch=scanEpoch;
         previews.execute(() -> {
             Bitmap bmp=null;
             try {
@@ -805,11 +868,16 @@ public class MainActivity extends Activity {
             } catch (Exception ignored) { }
             Bitmap result=bmp;
             mainHandler.post(() -> {
-                ImageView target=weak.get();
-                if (result!=null) {
-                    thumbnails.put(key,result);
-                    if (target!=null && key.equals(target.getTag())) target.setImageBitmap(result);
-                } else if (target!=null && key.equals(target.getTag())) target.setImageResource(android.R.drawable.ic_delete);
+                if (epoch != scanEpoch || isFinishing() || isDestroyed()) return;
+                List<WeakReference<ImageView>> targets=thumbnailWaiters.remove(key);
+                if (result!=null) thumbnails.put(key,result);
+                if (targets==null) return;
+                for (WeakReference<ImageView> weak : targets) {
+                    ImageView target=weak.get();
+                    if (target==null || !key.equals(target.getTag())) continue;
+                    if (result!=null) target.setImageBitmap(result);
+                    else target.setImageResource(android.R.drawable.ic_delete);
+                }
             });
         });
     }

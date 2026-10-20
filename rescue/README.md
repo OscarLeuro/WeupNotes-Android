@@ -1,34 +1,41 @@
-# Weup Rescue v0.2 · Weupperu.com
+# Weup Rescue v0.3 — Android Forensic Trace Scanner
 
-Proyecto Android Java, Android 8.0+ (API 26), sin INTERNET, sin analítica, sin dependencias de terceros en tiempo de ejecución.
+Autor: **Weupperu.com**. Java, Android 8.0+, aplicación local, sin INTERNET ni telemetría.
 
-## Recuperación y límites importantes
+## Qué hace
 
-**No existe una APK ordinaria capaz de hacer el equivalente a Recuva sobre los sectores borrados de la memoria interna cifrada de Android.** MediaStore/SAF dan acceso a archivos existentes y algunas papeleras, no al espacio libre. TRIM, sobrescritura y la pérdida de claves de cifrado pueden hacer una recuperación imposible incluso con root. No prometemos recuperar archivos eliminados definitivamente.
+- **Escaneo forense del almacenamiento interno COMPARTIDO** del Redmi con permiso especial *Administrar todos los archivos*, habilitado explícitamente por la persona en ajustes (Android 11+). `InternalTraceScanner` recorre en solo lectura directorios accesibles, incluyendo ocultos, miniaturas, copias, respaldos y cachés visibles, e identifica JPG, PNG, GIF, WEBP y algunos HEIC por **cabeceras binarias**, aunque la extensión sea errónea o falte.
+- Galería de fotografías con **miniaturas automáticas** calculadas fuera del hilo principal y caché LRU limitada, filtro por tipo/nombre; cada resultado se identifica como rastro/copia accesible o imagen existente. Miniatura y decodificación no garantizan integridad ni edad del borrado.
+- Selección individual y múltiple y **guardar/exportar** copias mediante selector del sistema sin modificar el origen. Resultados de análisis por firma exportables desde caché temporal de la aplicación.
+- Revisión de la papelera multimedia y listado de MediaStore y carpetas autorizadas, como métodos complementarios.
+- Carving por firmas JPG, PNG, PDF y ZIP/Office desde una **imagen binaria preexistente y sin cifrar** elegida por el usuario, con máximo de caché de 512 MB y límite de 100 candidatos. No equivale a leer la memoria interna cifrada.
+- Botón Detener, límites de inspección y exclusión de symlinks/directorios app-privados, sin red.
 
-**Análisis profundo real de imagen de microSD:** usa `ACTION_OPEN_DOCUMENT` para seleccionar una imagen binaria (.img/.dd/.bin), creada previamente y de forma segura desde una tarjeta microSD EXTRAÍBLE sin cifrar. `SignatureCarver` lee secuencialmente los bytes de esa imagen sin escribir en la fuente y busca firmas de:
+## Limitación forense fundamental
 
-- JPEG: SOI a EOI, validación de dimensiones con BitmapFactory.
-- PNG: cabecera a IEND, validación de dimensiones con BitmapFactory.
-- PDF: `%PDF-` hasta `%%EOF`, vista previa de la primera página si el renderer puede decodificarlo.
-- ZIP: firma local a fin de directorio central, validación con ZipFile; detecta DOCX, XLSX, PPTX por sus entradas internas.
+`MANAGE_EXTERNAL_STORAGE` no permite leer los sectores previamente borrados ni `/data`, y tampoco concede acceso a los directorios privados de otras apps en `/Android/data`. En el Redmi Note 13 Pro 5G, el cifrado de archivos, TRIM, borrado de claves o sobrescritura pueden hacer imposible recuperar las fotos originales eliminadas definitivamente hace 1–3 años. La aplicación busca rastros **todavía existentes y accesibles**, no promete recuperar bytes inaccesibles. Root/bootloader no se solicitan; no desbloquear el bootloader para probar, ya que puede borrar todos los datos.
 
-Solo detecta candidatos completos **contiguos**; las firmas no prueban por sí solas que los archivos sean correctos. Los tamaños máximos de cada candidato son 64 MB para JPEG/PNG y 128 MB para PDF/ZIP; máximo 100 candidatos y 512 MB de caché interna por exploración. Para evitar pérdida o sobrescritura accidental, **se recomienda generar la imagen de una microSD en otro dispositivo** y guardar las exportaciones en otro destino. No puede analizar directamente la memoria interna ni leer el espacio libre de una carpeta seleccionada. No accede a dispositivos de bloque sin root, ni evade el cifrado.
+## Instalación/compilación
 
-## Pantalla de resultados
+JDK 17, Gradle 8.9, SDK Android 35. `gradle :app:assembleDebug` desde la carpeta `rescue` en GitHub. Pipeline de Actions `.github/workflows/weup-rescue-apk.yml` de la rama `weup-rescue-android`. No instalar en el único dispositivo que guarde restos críticos sin valorar primero el efecto de escribir nuevos datos; incluso instalar una APK genera escrituras.
 
-- Cada coincidencia lleva su procedencia: `Archivo existente`, `En papelera` o `Reconstruido por firma · verificar`.
-- `Vista previa`: imágenes decodificadas, primera página PDF, lista de entradas ZIP/Office o muestra de texto; audio/vídeo existentes se abren con reproductor compatible de Android. La vista previa puede fallar para archivos cifrados o incompletos.
-- `Guardar archivo ↓`: selector nativo de Android (`ACTION_CREATE_DOCUMENT`) para elegir Descargas, microSD accesible u otra ubicación. El origen se abre en modo lectura, el destino recibe copia independiente; no hay ninguna descarga desde un servidor. Papelera: restauración sujeta a autorización de Android.
-- Indica desplazamiento de byte aproximado para imagen binaria, **no fecha inventada de eliminación**; búsqueda y filtrado por tipo/nombre; botón Detener durante el escaneo binario.
-- La caché de resultados reconstruidos es temporal; guarda enseguida lo que te interese. Al iniciar otro análisis binario se descartan resultados temporales del anterior.
+## Pruebas de motores independientes
 
-## Compilación
+```
+javac -d /tmp/weup-tests app/src/main/java/com/weupperu/rescate/InternalTraceScanner.java tests/InternalTraceScannerSmoke.java
+java -cp /tmp/weup-tests InternalTraceScannerSmoke
+javac -d /tmp/weup-tests app/src/main/java/com/weupperu/rescate/SignatureCarver.java tests/SignatureCarverSmoke.java
+java -cp /tmp/weup-tests SignatureCarverSmoke
+```
 
-JDK 17, Android SDK 35, Gradle 8.9. Abrir carpeta en Android Studio y ejecutar `gradle :app:assembleDebug`. También hay workflow de GitHub Actions para el proyecto ubicado en `rescue/` dentro de la rama independiente `weup-rescue-android` del repositorio. APK generado: `app/build/outputs/apk/debug/app-debug.apk` (firma de depuración del compilador; distintas máquinas pueden producir distintas claves debug y Android podría requerir desinstalar la anterior versión antes de instalar esta).
+## Política de privacidad
 
-Prueba unitaria sin Android: `javac -d /tmp/weup-test app/src/main/java/com/weupperu/rescate/SignatureCarver.java tests/SignatureCarverSmoke.java && java -cp /tmp/weup-test SignatureCarverSmoke`.
+Sin permiso de Internet. Nada se sube a servidores. La exploración nunca borra ni modifica los archivos originales. Todo resultado exportado se guarda únicamente tras elegir destino. Autoría: Weupperu.com.
 
-## Privacidad
 
-Permisos mínimos de multimedia para consultar elementos existentes; exploración de carpetas/imágenes y exportación con el selector del sistema. El manifiesto no incluye permiso INTERNET. El programa no hace root, no escribe en imágenes fuente ni elimina archivos originales. Autor: Weupperu.com.
+## v0.3.1: estabilidad del escaneo interno
+- Lista de resultados publicada mediante snapshots sincronizados para evitar ConcurrentModificationException.
+- Galería paginada (45 por bloque): no crea cientos de vistas/decodificaciones simultáneas.
+- Desduplicación de tareas de miniaturas; resultados devueltos a todas las vistas visibles.
+- Actualización de progreso limitada; validaciones de permiso y acceso antes del escaneo.
+- Mantiene escaneo de rastros accesibles, sin prometer lectura de bloques borrados y cifrados.
